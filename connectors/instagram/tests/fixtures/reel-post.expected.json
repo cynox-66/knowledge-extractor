@@ -1,0 +1,33 @@
+{
+  "id": "ig_xyz789",
+  "kind": "instagram-reel",
+  "state": "extracted",
+  "source": {
+    "providerName": "instagram",
+    "externalId": "xyz789",
+    "originalUri": "https://www.instagram.com/reel/xyz789/"
+  },
+  "author": {
+    "handle": "reel_creator",
+    "displayName": "Reel Creator"
+  },
+  "content": [
+    {
+      "type": "text",
+      "value": "Morning workout routine 💪 #fitness #motivation"
+    }
+  ],
+  "media": [
+    {
+      "id": "xyz789_media_0",
+      "type": "video",
+      "sourceUri": "https://cdn.example.com/media/reel_xyz789.mp4"
+    },
+    {
+      "id": "xyz789_media_1",
+      "type": "image",
+      "sourceUri": "https://cdn.example.com/media/reel_xyz789_thumb.jpg"
+    }
+  ],
+  "children": []
+}
