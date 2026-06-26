@@ -92,6 +92,50 @@ export class Scheduler {
     return Array.from(this.tasks.values()).filter((t) => t.state === TaskState.QUEUED).length;
   }
 
+  /** Current queue depth (tasks awaiting processing). Alias of getPendingCount. */
+  getQueueDepth(): number {
+    return this.getPendingCount();
+  }
+
+  /** True when no task remains in a non-terminal state (queued/opening/extracting). */
+  isDrained(): boolean {
+    for (const t of this.tasks.values()) {
+      if (
+        t.state === TaskState.QUEUED ||
+        t.state === TaskState.OPENING ||
+        t.state === TaskState.EXTRACTING
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Serializes the full task map for persistence. `ICrawlTask` is a plain
+   * data shape, so this is a structured-clone-safe snapshot that preserves
+   * attempts, backoff (`nextRetryAt`), priorities, and last error.
+   */
+  snapshot(): ICrawlTask[] {
+    return Array.from(this.tasks.values());
+  }
+
+  /**
+   * Rehydrates the queue from a persisted snapshot after a service-worker
+   * restart. Any task left mid-flight (OPENING/EXTRACTING) when the worker was
+   * suspended is reset to QUEUED so it is retried rather than lost.
+   */
+  restore(tasks: ICrawlTask[]): void {
+    this.tasks.clear();
+    for (const task of tasks) {
+      if (task.state === TaskState.OPENING || task.state === TaskState.EXTRACTING) {
+        task.state = TaskState.QUEUED;
+      }
+      this.tasks.set(task.id, task);
+    }
+    this.logger.info(`Scheduler restored ${this.tasks.size} task(s) from snapshot`);
+  }
+
   clear(): void {
     this.tasks.clear();
   }

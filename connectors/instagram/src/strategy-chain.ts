@@ -6,9 +6,17 @@ import {
 } from '@knowledge-extractor/types';
 import { Logger } from '@knowledge-extractor/shared';
 
+/** The successful output of a chain run, tagged with the winning strategy. */
+export interface IChainResult<TOutput> {
+  data: TOutput;
+  /** Name of the strategy that produced the result (for diagnostics). */
+  strategyName: string;
+}
+
 /**
  * Executes an ordered list of strategies, returning the result of the first
- * applicable one. If no strategy succeeds, throws a PlatformError.
+ * applicable one (tagged with its name). If no strategy succeeds, throws a
+ * PlatformError.
  */
 export class StrategyChain<TInput, TOutput> {
   private readonly logger: Logger;
@@ -19,7 +27,7 @@ export class StrategyChain<TInput, TOutput> {
     this.strategies = strategies;
   }
 
-  execute(input: TInput): TOutput {
+  execute(input: TInput): IChainResult<TOutput> {
     for (const strategy of this.strategies) {
       this.logger.debug(`Trying strategy: ${strategy.strategyName}`);
       let result: IStrategyResult<TOutput>;
@@ -34,7 +42,7 @@ export class StrategyChain<TInput, TOutput> {
         this.logger.info(
           `Strategy "${strategy.strategyName}" succeeded (confidence=${result.confidence.toFixed(2)})`,
         );
-        return result.data;
+        return { data: result.data, strategyName: strategy.strategyName };
       }
 
       this.logger.debug(

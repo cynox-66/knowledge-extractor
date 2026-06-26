@@ -1,20 +1,31 @@
 import { ICrawlSession } from '@knowledge-extractor/types';
-import { Logger } from '@knowledge-extractor/shared';
+import { Logger, MetricsCollector } from '@knowledge-extractor/shared';
 
 /**
- * Manages the persistent state of a crawl session using chrome.storage.session.
- * The popup dashboard reads this state.
+ * Single source of truth for crawl state. Persists `ICrawlSession` to
+ * `chrome.storage.session` so it survives popup closure and service-worker
+ * suspension, and broadcasts `SESSION_UPDATED` so the (stateless) Popup can
+ * live-render. All numeric counters are sourced from `MetricsCollector`; this
+ * class does not maintain its own.
  */
 export class SessionManager {
   private readonly logger = new Logger('SessionManager');
   private readonly STORAGE_KEY = 'crawl_session';
   private session: ICrawlSession | null = null;
 
+  constructor(private readonly metrics: MetricsCollector) {}
+
+  /**
+   * Loads any persisted session. If one exists, its metrics snapshot is used to
+   * rehydrate the canonical `MetricsCollector` so counters survive SW restart.
+   */
   async init(): Promise<void> {
     const data = await chrome.storage.session.get(this.STORAGE_KEY);
-    if (data[this.STORAGE_KEY]) {
-      this.session = data[this.STORAGE_KEY] as ICrawlSession;
-      this.logger.info(`Restored existing session: ${this.session.sessionId}`);
+    const stored = data[this.STORAGE_KEY] as ICrawlSession | undefined;
+    if (stored) {
+      this.session = stored;
+      this.metrics.hydrate(stored.metrics);
+      this.logger.info(`Restored existing session: ${stored.sessionId}`);
     } else {
       this.session = this.createEmptySession();
       await this.persist();
@@ -23,9 +34,10 @@ export class SessionManager {
   }
 
   startNewSession(): ICrawlSession {
+    this.metrics.reset();
     this.session = this.createEmptySession();
     this.session.isRunning = true;
-    this.persist();
+    void this.persist();
     return this.session;
   }
 
@@ -33,43 +45,17 @@ export class SessionManager {
     return this.session;
   }
 
+  /** Patches execution-status fields and re-persists (refreshing metrics). */
   async update(patch: Partial<ICrawlSession>): Promise<void> {
     if (!this.session) return;
     this.session = { ...this.session, ...patch };
     await this.persist();
   }
 
-  async increment(
-    field:
-      | 'discovered'
-      | 'queued'
-      | 'extracted'
-      | 'failed'
-      | 'totalRetries'
-      | 'scrollFailures'
-      | 'selectorFailures',
-    by = 1,
-  ): Promise<void> {
+  /** Pushes the latest metrics snapshot (and queue depth) into the session. */
+  async sync(queueDepth: number): Promise<void> {
     if (!this.session) return;
-    this.session[field] += by;
-    await this.persist();
-  }
-
-  async addMetrics(metrics: {
-    modalOpenLatencyMs?: number;
-    domStabilizationTimeMs?: number;
-    extractionDurationMs?: number;
-    modalCloseDurationMs?: number;
-  }): Promise<void> {
-    if (!this.session) return;
-    if (metrics.modalOpenLatencyMs)
-      this.session.totalModalOpenLatencyMs += metrics.modalOpenLatencyMs;
-    if (metrics.domStabilizationTimeMs)
-      this.session.totalDomStabilizationTimeMs += metrics.domStabilizationTimeMs;
-    if (metrics.extractionDurationMs)
-      this.session.totalExtractionDurationMs += metrics.extractionDurationMs;
-    if (metrics.modalCloseDurationMs)
-      this.session.totalModalCloseDurationMs += metrics.modalCloseDurationMs;
+    this.session.queueDepth = queueDepth;
     await this.persist();
   }
 
@@ -77,28 +63,25 @@ export class SessionManager {
     return {
       sessionId: crypto.randomUUID(),
       startedAt: new Date().toISOString(),
-      discovered: 0,
-      queued: 0,
-      extracted: 0,
-      failed: 0,
       isRunning: false,
       isPaused: false,
       isCancelled: false,
-      totalModalOpenLatencyMs: 0,
-      totalDomStabilizationTimeMs: 0,
-      totalExtractionDurationMs: 0,
-      totalModalCloseDurationMs: 0,
-      totalRetries: 0,
-      scrollFailures: 0,
-      selectorFailures: 0,
+      currentResource: '',
+      navigationStatus: 'idle',
+      queueDepth: 0,
+      metrics: this.metrics.snapshot(),
     };
   }
 
+  /**
+   * Persists the session, always embedding the freshest metrics snapshot so the
+   * stored state and the Popup never diverge from the canonical collector.
+   */
   private async persist(): Promise<void> {
     if (!this.session) return;
+    this.session.metrics = this.metrics.snapshot();
     await chrome.storage.session.set({ [this.STORAGE_KEY]: this.session });
-
-    // Broadcast status to any open popups
+    // Broadcast to any open popups (ignored if none are listening).
     chrome.runtime.sendMessage({ action: 'SESSION_UPDATED', data: this.session }).catch(() => {});
   }
 }

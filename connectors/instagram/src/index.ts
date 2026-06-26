@@ -48,14 +48,16 @@ export class InstagramConnector implements IConnector<IInstagramParsedPost> {
   /**
    * Extracts a raw, Instagram-shaped record from a DOM `<article>` element.
    * This is the single runtime extraction path: StrategyChain → Parser.enrich.
-   * Throws `PlatformError` (PARSE_ERROR) if every strategy is exhausted.
+   * Returns the enriched record tagged with the winning strategy name (for
+   * diagnostics). Throws `PlatformError` (PARSE_ERROR) if every strategy is
+   * exhausted.
    *
    * @param article A DOM `<article>` element from the Instagram page.
    */
-  extract(article: ArticleElement): IInstagramParsedPost {
+  extract(article: ArticleElement): { post: IInstagramParsedPost; strategyName: string } {
     this.logger.debug('Extracting article via strategy chain');
-    const raw = this.chain.execute(article);
-    return this.parser.enrich(raw);
+    const { data, strategyName } = this.chain.execute(article);
+    return { post: this.parser.enrich(data), strategyName };
   }
 
   /**

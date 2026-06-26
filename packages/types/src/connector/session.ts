@@ -1,3 +1,5 @@
+import { IExtractionMetrics } from './metrics.js';
+
 /**
  * Defines the execution state of a single CrawlTask.
  */
@@ -49,26 +51,28 @@ export interface ICrawlTask {
 }
 
 /**
- * CrawlSession tracking for the Background Worker.
+ * The persisted crawl session — the single source of truth for the Background
+ * Worker and the (stateless) Popup. Stored in `chrome.storage.session` so it
+ * survives popup closure and service-worker suspension.
+ *
+ * Execution status lives here; all numeric counters live in `metrics`
+ * (sourced canonically from `MetricsCollector`) and are never duplicated.
  */
 export interface ICrawlSession {
   sessionId: string;
   startedAt: string;
-  discovered: number;
-  queued: number;
-  extracted: number;
-  failed: number;
-  currentResource?: string;
+
+  // ---- Execution status ----------------------------------------------------
   isRunning: boolean;
   isPaused: boolean;
   isCancelled: boolean;
+  /** The URI currently being processed ('' = none). */
+  currentResource: string;
+  /** Human-readable pipeline stage for the current resource (e.g. 'opening'). */
+  navigationStatus: string;
+  /** Current Scheduler queue depth (pending tasks awaiting processing). */
+  queueDepth: number;
 
-  // Advanced Diagnostics
-  totalModalOpenLatencyMs: number;
-  totalDomStabilizationTimeMs: number;
-  totalExtractionDurationMs: number;
-  totalModalCloseDurationMs: number;
-  totalRetries: number;
-  scrollFailures: number;
-  selectorFailures: number;
+  // ---- Canonical metrics snapshot -----------------------------------------
+  metrics: IExtractionMetrics;
 }
