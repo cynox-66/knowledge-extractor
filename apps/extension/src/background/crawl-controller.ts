@@ -1,5 +1,7 @@
 import { Logger, MetricsCollector, DiagnosticsCollector } from '@knowledge-extractor/shared';
 import { IDiscoveredResource, ICrawlSession } from '@knowledge-extractor/types';
+import { InstagramConnector } from '@knowledge-extractor/connector-instagram';
+import { InMemoryStorage } from '@knowledge-extractor/storage';
 import { SessionManager } from './session-manager';
 import { Scheduler } from './scheduler';
 
@@ -15,13 +17,22 @@ export class CrawlController {
   // External dependencies
   private metrics: MetricsCollector;
   private diagnostics: DiagnosticsCollector;
+  private connector: InstagramConnector;
+  private storage: InMemoryStorage;
 
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
   private isProcessing = false;
 
-  constructor(metrics: MetricsCollector, diagnostics: DiagnosticsCollector) {
+  constructor(
+    metrics: MetricsCollector,
+    diagnostics: DiagnosticsCollector,
+    connector: InstagramConnector,
+    storage: InMemoryStorage,
+  ) {
     this.metrics = metrics;
     this.diagnostics = diagnostics;
+    this.connector = connector;
+    this.storage = storage;
   }
 
   async init(): Promise<void> {
@@ -111,16 +122,46 @@ export class CrawlController {
       await this.sessionManager.update({ currentResource: task.targetUri });
       this.broadcastEvent('NAVIGATION_STARTED', { targetUri: task.targetUri });
 
-      // PHASE 2 & 3: Here we will coordinate with Navigator to open the resource.
-      // For now, this is a placeholder to show the flow.
-      // await Navigator.openResource(task.targetUri);
+      // PHASE 2: Coordinate with Navigator to open the resource
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tabs[0]?.id) throw new Error('No active tab');
+
+      const navResponse = await chrome.tabs.sendMessage(tabs[0].id, {
+        action: 'NAVIGATE_OPEN',
+        data: { targetUri: task.targetUri },
+      });
+
+      if (!navResponse?.success) {
+        throw new Error('Navigator failed to open resource');
+      }
 
       this.scheduler.markExtracting(task.id);
       this.broadcastEvent('EXTRACTION_STARTED', { targetUri: task.targetUri });
 
-      // Placeholder: Execute Extraction & Normalization
-      // const extracted = await Extractor.extract(task.targetUri);
-      // const normalized = await Normalizer.normalize(extracted);
+      // Execute Extraction
+      const extractResponse = await chrome.tabs.sendMessage(tabs[0].id, {
+        action: 'EXTRACT_RESOURCE',
+        data: { targetUri: task.targetUri },
+      });
+
+      if (!extractResponse?.success) {
+        throw new Error(extractResponse?.error || 'Extraction failed');
+      }
+
+      // Close resource (modal) after extraction
+      await chrome.tabs.sendMessage(tabs[0].id, { action: 'NAVIGATE_CLOSE' });
+
+      // Execute Normalization
+      const normalized = await this.connector.normalize(
+        extractResponse.data as Parameters<InstagramConnector['normalize']>[0],
+      );
+      this.broadcastEvent('RESOURCE_NORMALIZED', normalized);
+
+      // Execute Persistence
+      const tx = await this.storage.beginTransaction();
+      await this.storage.saveResource(normalized, tx);
+      await tx.commit();
+      this.broadcastEvent('RESOURCE_PERSISTED', { resourceId: normalized.id });
 
       this.scheduler.markCompleted(task.id);
       await this.sessionManager.increment('extracted');

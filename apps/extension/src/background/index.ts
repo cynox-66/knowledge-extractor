@@ -4,11 +4,15 @@
 import { Logger, MetricsCollector, DiagnosticsCollector } from '@knowledge-extractor/shared';
 import { IDiscoveredResource } from '@knowledge-extractor/types';
 import { CrawlController } from './crawl-controller';
+import { InstagramConnector } from '@knowledge-extractor/connector-instagram';
+import { InMemoryStorage } from '@knowledge-extractor/storage';
 
 const logger = new Logger('BackgroundWorker');
 const metrics = new MetricsCollector();
 const diagnostics = new DiagnosticsCollector();
-const controller = new CrawlController(metrics, diagnostics);
+const connector = new InstagramConnector();
+const storage = new InMemoryStorage();
+const controller = new CrawlController(metrics, diagnostics, connector, storage);
 
 // Initialize controller and session
 controller.init().catch((err) => logger.error('Failed to init controller', err));
@@ -39,6 +43,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.action === 'GET_SESSION') {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const sessionManager = (controller as any).sessionManager;
     sendResponse(sessionManager?.getSession() || null);
     return false;

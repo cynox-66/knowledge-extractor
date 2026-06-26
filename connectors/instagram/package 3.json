@@ -1,0 +1,10 @@
+{
+  "name": "@knowledge-extractor/connector-instagram",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "dependencies": {
+    "@knowledge-extractor/types": "workspace:*",
+    "@knowledge-extractor/shared": "workspace:*"
+  }
+}
