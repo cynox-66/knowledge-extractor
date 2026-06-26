@@ -62,6 +62,82 @@ for the non-resource stores. These are additive to the concrete class and do not
 change the frozen `IStorageEngine` interface; they are wired into `SessionManager`
 and `CrawlController` in Phase 3.
 
+## Media store (Beta-0 Phase 2)
+
+Binary media (images, later video/audio) is persisted separately from structured
+data: **bytes go to OPFS, metadata stays small and queryable.** The contract is
+`IMediaStore` (`packages/types/src/storage/media.ts`); it is connector-agnostic
+(no platform logic) and implementation-agnostic.
+
+```
+IMediaStore  (types — public contract)
+    │ put / get / exists / delete / list / statistics / verify / cleanup
+    ▼
+MediaStore   (storage — layout, metadata sidecars, hashing, crash-consistency)
+    │ delegates raw bytes to ↓
+    ▼
+IMediaBlobBackend  (storage — the only OPFS-aware seam)
+    ├── OpfsBlobBackend       (browser: SW / offscreen, extension origin)
+    └── InMemoryBlobBackend   (tests / non-OPFS fallback)
+```
+
+### Why OPFS, not IndexedDB blobs
+
+IndexedDB blob throughput is poor and serializes through structured-clone +
+transaction machinery. OPFS gives file-grade writes for large binaries and keeps
+binary bytes out of the structured store. Metadata (small, queryable) stays in
+sidecar records; bytes go to OPFS.
+
+### Runtime ownership (important for Phase 3)
+
+OPFS is **origin-scoped**. Only extension-origin contexts (service worker,
+offscreen document, popup) can read/write the extension's OPFS. A **content
+script runs at the page origin (instagram.com) and cannot** use it. So media
+bytes captured in the content script (Beta-1) must be messaged to the service
+worker, which owns the `MediaStore`.
+
+### Directory layout (backend-relative)
+
+```
+media/
+  images/<id>      videos/<id>      audio/<id>      documents/<id>      other/<id>
+  meta/<id>.json   metadata sidecar (commit marker)
+  tmp/             reserved for future streaming writes
+  thumbnails/      cache/   reserved names for later phases (unused)
+```
+
+### Crash consistency
+
+A blob is committed by writing its metadata sidecar **after** the bytes (blob
+writes are atomic at the backend via OPFS `createWritable`). A blob with no
+`complete` sidecar — or a sidecar whose blob is missing — is an orphan that
+`cleanup()` removes. Integrity is verifiable via stored `sizeBytes` + SHA-256
+`hash` (`verify(id)`).
+
+### Metadata (`IMediaMetadata`)
+
+`id`, `type`, `mimeType`, `sizeBytes`, `hash`, `storagePath`, `state`,
+`createdAt`, `lastAccess`, `source?`. Dimensions (width/height/duration) are
+deliberately omitted: deriving them requires decoding media, which is an
+enrichment concern, not storage.
+
+### Desktop / cloud compatibility
+
+Swap `IMediaBlobBackend` for a Node `fs` backend (desktop) or an object-store
+backend (cloud). `IMediaStore` and all consumers are unchanged.
+
+### Limitations
+
+- The in-memory index is rebuilt by reading all sidecars on first access — O(n)
+  in blob count. Fine for an Instagram-scale collection; a manifest cache is the
+  future optimization if needed.
+- `lastAccess` is updated in the runtime cache only (no write-per-read); durable
+  persistence arrives with LRU cleanup.
+- `OpfsBlobBackend` is exercised via the in-memory backend in unit tests; a real
+  browser smoke test is part of Phase 5.
+- `navigator.storage.persist()` is **not** requested yet (Phase 3) — OPFS is
+  durable across restart but evictable under storage pressure until then.
+
 ## Session/queue persistence (Alpha — pre-Phase-3)
 
 Until Phase 3 wires the durable engine in, crawl session state and the Scheduler
