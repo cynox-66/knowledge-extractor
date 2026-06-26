@@ -8,3 +8,4 @@ export * from './messaging';
 export * from './errors';
 export * from './events';
 export * from './diagnostics';
+export * from './session';

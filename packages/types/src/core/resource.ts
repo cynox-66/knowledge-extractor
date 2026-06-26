@@ -16,6 +16,16 @@ export enum ResourceState {
 }
 
 /**
+ * Tracks which parts of a resource have been successfully extracted.
+ */
+export interface IResourceCompleteness {
+  thumbnail: boolean;
+  metadata: boolean;
+  media: boolean;
+  ocr: boolean;
+}
+
+/**
  * The fundamental Aggregate Root of the Knowledge Extractor domain.
  * A Resource represents a normalized, autonomous unit of knowledge
  * translated from an external provider.
@@ -55,4 +65,8 @@ export interface IResource {
    * (e.g., a Thread containing multiple nested reply Resources).
    */
   children?: IResource[];
+  /**
+   * Indicates the extraction completeness of this resource.
+   */
+  completeness: IResourceCompleteness;
 }

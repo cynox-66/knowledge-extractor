@@ -7,10 +7,12 @@
 import { IDiscoveredResource } from '@knowledge-extractor/types';
 import { Logger, featureFlags, FeatureFlag, MetricsCollector } from '@knowledge-extractor/shared';
 import { DiscoveryEngine } from '@knowledge-extractor/connector-instagram';
+import { Navigator } from './navigator';
 
 const logger = new Logger('ContentScript');
 const metrics = new MetricsCollector();
 const engine = new DiscoveryEngine();
+const navigator = new Navigator();
 
 const pendingQueue: Array<{ resource: IDiscoveredResource; fingerprint: string }> = [];
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -38,6 +40,31 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     extractSingleResource(targetUri)
       .then(sendResponse)
       .catch((err: unknown) => sendResponse({ success: false, error: String(err) }));
+    return true;
+  }
+
+  if (message.action === 'NAVIGATE_OPEN') {
+    const { targetUri } = (message.data ?? {}) as { targetUri: string };
+    navigator
+      .openResource(targetUri)
+      .then((success) => sendResponse({ success }))
+      .catch((err) => sendResponse({ success: false, error: String(err) }));
+    return true;
+  }
+
+  if (message.action === 'NAVIGATE_CLOSE') {
+    navigator
+      .closeResource()
+      .then(() => sendResponse({ success: true }))
+      .catch((err) => sendResponse({ success: false, error: String(err) }));
+    return true;
+  }
+
+  if (message.action === 'NAVIGATE_SCROLL') {
+    navigator
+      .scrollGrid()
+      .then((success) => sendResponse({ success }))
+      .catch((err) => sendResponse({ success: false, error: String(err) }));
     return true;
   }
 });

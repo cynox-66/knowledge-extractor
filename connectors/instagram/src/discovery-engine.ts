@@ -5,11 +5,11 @@ import { ResourceFingerprinter } from './fingerprinter';
 type DiscoveryCallback = (resource: IDiscoveredResource, fingerprint: string) => void;
 
 /**
- * The Discovery Engine monitors the Instagram DOM for post articles
+ * The Discovery Engine monitors the Instagram DOM for post articles and grid items
  * using a MutationObserver and maintains a deduplication registry to prevent
  * repeated extraction of the same resource during infinite scrolling.
  *
- * Pipeline: MutationObserver → Discovery Queue → Deduplication → Callback
+ * It dynamically adapts to the current layout (Grid vs Feed vs Detail).
  */
 export class DiscoveryEngine {
   private readonly logger = new Logger('DiscoveryEngine');
@@ -18,25 +18,22 @@ export class DiscoveryEngine {
   private observer: MutationObserver | null = null;
   private callback: DiscoveryCallback | null = null;
 
-  /**
-   * Start observing the DOM for new Instagram article elements.
-   * @param callback Invoked for each newly discovered, deduplicated resource.
-   */
   start(callback: DiscoveryCallback): void {
     this.callback = callback;
     this.logger.info('Discovery Engine starting');
 
-    // Immediately scan current DOM state
     this.scanDOM(document.body);
 
-    // Then watch for dynamic mutations (infinite scroll, SPA navigation)
     this.observer = new MutationObserver((mutations) => {
+      let shouldScan = false;
       for (const mutation of mutations) {
-        mutation.addedNodes.forEach((node) => {
-          if (node instanceof Element) {
-            this.scanDOM(node);
-          }
-        });
+        if (mutation.addedNodes.length > 0) {
+          shouldScan = true;
+          break;
+        }
+      }
+      if (shouldScan) {
+        this.scanDOM(document.body);
       }
     });
 
@@ -55,42 +52,65 @@ export class DiscoveryEngine {
   }
 
   private scanDOM(root: Element): void {
+    // 1. Grid layout: Look for post links inside typical grid containers
+    const gridLinks = Array.from(
+      root.querySelectorAll<HTMLAnchorElement>('a[href*="/p/"], a[href*="/reel/"]'),
+    );
+    for (const link of gridLinks) {
+      // Exclude author profile links, explore tags, etc.
+      if (this.isValidGridLink(link)) {
+        this.processResource(link.href, link);
+      }
+    }
+
+    // 2. Feed / Detail layout: Look for full article elements
     const articles = root.matches('article')
       ? [root]
       : Array.from(root.querySelectorAll('article'));
 
     for (const article of articles) {
-      this.processArticle(article);
+      const link =
+        article.querySelector<HTMLAnchorElement>('a[href*="/p/"]') ??
+        article.querySelector<HTMLAnchorElement>('a[href*="/reel/"]');
+      if (link) {
+        this.processResource(link.href, article);
+      }
     }
   }
 
-  private processArticle(article: Element): void {
-    const link =
-      article.querySelector<HTMLAnchorElement>('a[href*="/p/"]') ??
-      article.querySelector<HTMLAnchorElement>('a[href*="/reel/"]');
+  private isValidGridLink(link: HTMLAnchorElement): boolean {
+    // Basic heuristic: grid items usually contain an image and aren't inside headers
+    return link.querySelector('img') !== null && link.closest('header') === null;
+  }
 
-    if (!link) return;
+  private processResource(sourceUri: string, contextEl: Element): void {
+    // Normalize URL to strip query params
+    let cleanUri = sourceUri;
+    try {
+      const url = new URL(sourceUri);
+      cleanUri = url.origin + url.pathname;
+    } catch {
+      // ignore
+    }
 
-    const sourceUri = link.href;
-    const authorEl = article.querySelector<HTMLAnchorElement>('header a');
-    const imgs = article.querySelectorAll('img');
+    const authorEl = contextEl.querySelector<HTMLAnchorElement>('header a');
+    const imgs = contextEl.querySelectorAll('img');
 
     const fp = this.fingerprinter.fingerprint({
-      sourceUri,
+      sourceUri: cleanUri,
       authorHandle: authorEl?.textContent?.trim(),
       mediaCount: imgs.length,
-      captionPreview: article.querySelector('h1, span')?.textContent?.slice(0, 64),
+      captionPreview: contextEl.querySelector('h1, span')?.textContent?.slice(0, 64),
     });
 
     if (this.seen.has(fp.hash)) {
-      this.logger.debug(`Duplicate resource skipped: ${fp.hash}`);
       return;
     }
 
     this.seen.add(fp.hash);
-    this.logger.info(`Discovered new resource: ${sourceUri} (fp=${fp.hash})`);
+    this.logger.info(`Discovered new resource: ${cleanUri} (fp=${fp.hash})`);
 
-    this.callback?.({ targetUri: sourceUri, providerName: 'instagram' }, fp.hash);
+    this.callback?.({ targetUri: cleanUri, providerName: 'instagram' }, fp.hash);
   }
 
   getDiscoveredCount(): number {
