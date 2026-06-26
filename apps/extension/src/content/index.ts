@@ -109,6 +109,7 @@ function flushQueue(): void {
 async function extractSingleResource(targetUri: string): Promise<{
   success: boolean;
   data?: unknown;
+  strategyName?: string;
   domSnapshot?: string;
   error?: string;
 }> {
@@ -129,8 +130,8 @@ async function extractSingleResource(targetUri: string): Promise<{
 
   try {
     // Parsing concern: delegated entirely to the connector's strategy chain.
-    const parsed = connector.extract(target);
-    return { success: true, data: parsed };
+    const { post, strategyName } = connector.extract(target);
+    return { success: true, data: post, strategyName };
   } catch (err) {
     return { success: false, domSnapshot, error: String(err) };
   }

@@ -11,9 +11,11 @@
 1. Run `pnpm run build` inside `apps/extension`
 2. Load `apps/extension/dist` as an unpacked extension in Chrome
 3. Navigate to `https://www.instagram.com/saved`
-4. Click **Start Extraction** in the popup
-5. Scroll through the saved collection until the feed ends
-6. Click **Export JSON** — this downloads the full `ISessionReport`
+4. Click **Start** in the popup
+5. The crawler drives infinite scroll automatically and terminates at end-of-feed.
+   You may close the popup at any time — the crawl continues in the background
+   service worker and the popup rehydrates from `SessionManager` when reopened.
+6. Click **Export Diagnostics** — this downloads the full `ISessionReport`
 7. Replace the placeholder values below with data from the export
 
 ---
@@ -32,17 +34,29 @@
 
 ## Extraction Metrics
 
-| Metric                            | Count | Notes                                                       |
-| :-------------------------------- | :---: | :---------------------------------------------------------- |
-| **Discovered**                    |   —   | Resources found by `DiscoveryEngine` via `MutationObserver` |
-| **Extracted**                     |   —   | Resources successfully normalized into `IResource`          |
-| **Duplicates**                    |   —   | Resources skipped by fingerprint deduplication              |
-| **Skipped**                       |   —   | Resources skipped by feature flags                          |
-| **Failed**                        |   —   | Resources that produced an `IFailureRecord`                 |
-| **Extraction time (total ms)**    |   —   | Wall-clock time in content script extraction                |
-| **Normalization time (total ms)** |   —   | Wall-clock time in `InstagramNormalizer`                    |
-| **Average extraction time (ms)**  |   —   | `extractionTimeMs / extracted`                              |
-| **Success rate**                  |   —   | `extracted / discovered * 100` %                            |
+> All values originate from the canonical `MetricsCollector` (background worker),
+> embedded in the persisted `ICrawlSession` and exported via `EXPORT_DIAGNOSTICS`.
+
+| Metric                          | Count | Notes                                                       |
+| :------------------------------ | :---: | :---------------------------------------------------------- |
+| **Discovered**                  |   —   | Resources found by `DiscoveryEngine` via `MutationObserver` |
+| **Queued**                      |   —   | Resources enqueued onto the `Scheduler`                     |
+| **Extracted**                   |   —   | Resources successfully parsed from the DOM                  |
+| **Normalized**                  |   —   | Raw records mapped to `IResource`                           |
+| **Persisted**                   |   —   | Resources written to storage                                |
+| **Duplicates**                  |   —   | Resources skipped by fingerprint/queue deduplication        |
+| **Skipped**                     |   —   | Resources skipped by feature flags                          |
+| **Failed (permanent)**          |   —   | Tasks that exhausted `maxAttempts`                          |
+| **Retries**                     |   —   | Retry attempts scheduled (exponential backoff)              |
+| **Navigation failures**         |   —   | Failures while opening the resource                         |
+| **Extraction failures**         |   —   | Failures during DOM parsing                                 |
+| **Normalization failures**      |   —   | Failures during normalization                               |
+| **Avg extraction time (ms)**    |   —   | `extractionTimeMs / extracted`                              |
+| **Avg normalization time (ms)** |   —   | `normalizationTimeMs / normalized`                          |
+| **Avg navigation latency (ms)** |   —   | `navigationTimeMs / navigations`                            |
+| **Peak queue size**             |   —   | Highest observed `Scheduler` depth                          |
+| **Crawl duration (ms)**         |   —   | Total elapsed wall-clock time                               |
+| **Success rate**                |   —   | `persisted / discovered * 100` %                            |
 
 ---
 
@@ -167,11 +181,14 @@ or AI enrichment.
 
 The following diagnostic infrastructure was implemented to make this report possible:
 
-| Component                                             | Location                                       |
-| :---------------------------------------------------- | :--------------------------------------------- |
-| `IFailureRecord`, `ISessionReport`, `FailureCategory` | `packages/types/src/diagnostics/`              |
-| `DiagnosticsCollector`                                | `packages/shared/src/diagnostics-collector.ts` |
-| DOM snapshot capture per article                      | `apps/extension/src/content/index.ts`          |
-| Failure classification heuristic                      | `apps/extension/src/background/index.ts`       |
-| `EXPORT_DIAGNOSTICS` message handler                  | `apps/extension/src/background/index.ts`       |
-| Alpha Diagnostics Dashboard popup                     | `apps/extension/src/popup/index.tsx`           |
+| Component                                             | Location                                            |
+| :---------------------------------------------------- | :-------------------------------------------------- |
+| `IFailureRecord`, `ISessionReport`, `FailureCategory` | `packages/types/src/diagnostics/`                   |
+| `DiagnosticsCollector` (driven by the controller)     | `packages/shared/src/diagnostics-collector.ts`      |
+| Canonical `MetricsCollector`                          | `packages/shared/src/metrics-collector.ts`          |
+| DOM snapshot capture per article (failure path)       | `apps/extension/src/content/index.ts`               |
+| Failure categorization by pipeline stage              | `apps/extension/src/background/crawl-controller.ts` |
+| Metrics + diagnostics wiring into the crawl loop      | `apps/extension/src/background/crawl-controller.ts` |
+| MV3 alarm watchdog + queue/session persistence        | `apps/extension/src/background/crawl-controller.ts` |
+| `EXPORT_DIAGNOSTICS` message handler                  | `apps/extension/src/background/index.ts`            |
+| Stateless Alpha Diagnostics Dashboard popup           | `apps/extension/src/popup/index.tsx`                |

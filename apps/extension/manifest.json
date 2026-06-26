@@ -15,5 +15,5 @@
       "js": ["src/content/index.ts"]
     }
   ],
-  "permissions": ["activeTab", "scripting"]
+  "permissions": ["activeTab", "scripting", "alarms", "storage"]
 }
