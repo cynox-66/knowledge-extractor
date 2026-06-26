@@ -1,27 +1,61 @@
 import { Logger, MetricsCollector, DiagnosticsCollector } from '@knowledge-extractor/shared';
-import { IDiscoveredResource, ICrawlSession } from '@knowledge-extractor/types';
+import {
+  IDiscoveredResource,
+  ICrawlSession,
+  ISessionReport,
+  FailureCategory,
+  ICrawlTask,
+} from '@knowledge-extractor/types';
 import { InstagramConnector } from '@knowledge-extractor/connector-instagram';
 import { InMemoryStorage } from '@knowledge-extractor/storage';
 import { SessionManager } from './session-manager.js';
 import { Scheduler } from './scheduler.js';
 
+/** Pipeline stage, used to categorize failures without bespoke error classes. */
+type Stage = 'navigation' | 'extraction' | 'normalization';
+
+/** The shape the content script returns from EXTRACT_RESOURCE. */
+interface ExtractResponse {
+  success: boolean;
+  data?: unknown;
+  strategyName?: string;
+  domSnapshot?: string;
+  error?: string;
+}
+
 /**
- * Supreme Orchestrator of the Crawl Lifecycle.
- * Pipeline: Discovery → Queue → Scheduler → Navigator → Extractor → Normalizer → Persistence
+ * Supreme orchestrator of the crawl lifecycle, hardened for the MV3
+ * service-worker model.
+ *
+ * Pipeline: Discovery → Queue → Scheduler → Navigator → Extractor → Normalizer
+ *           → Persistence → Metrics/Diagnostics
+ *
+ * MV3 safety:
+ *  - The processing loop is a self-scheduling `setTimeout` chain that only runs
+ *    while a crawl is active (no perpetual `setInterval`).
+ *  - A `chrome.alarms` watchdog wakes the worker after suspension and resumes
+ *    the loop from persisted state.
+ *  - Scheduler queue and session are persisted to `chrome.storage.session`
+ *    after every state transition, so no work is lost or duplicated.
  */
 export class CrawlController {
+  static readonly ALARM_NAME = 'ke-crawl-tick';
+  private static readonly SCHED_KEY = 'crawl_scheduler';
+  private static readonly TICK_MS = 800;
+  private static readonly MAX_EMPTY_SCROLLS = 3;
+
   private readonly logger = new Logger('CrawlController');
-  private readonly sessionManager = new SessionManager();
+  private readonly sessionManager: SessionManager;
   private readonly scheduler = new Scheduler();
 
-  // External dependencies
-  private metrics: MetricsCollector;
-  private diagnostics: DiagnosticsCollector;
-  private connector: InstagramConnector;
-  private storage: InMemoryStorage;
+  private readonly metrics: MetricsCollector;
+  private readonly diagnostics: DiagnosticsCollector;
+  private readonly connector: InstagramConnector;
+  private readonly storage: InMemoryStorage;
 
-  private pollTimer: ReturnType<typeof setTimeout> | null = null;
+  private loopTimer: ReturnType<typeof setTimeout> | null = null;
   private isProcessing = false;
+  private emptyScrolls = 0;
 
   constructor(
     metrics: MetricsCollector,
@@ -33,43 +67,84 @@ export class CrawlController {
     this.diagnostics = diagnostics;
     this.connector = connector;
     this.storage = storage;
+    this.sessionManager = new SessionManager(metrics);
   }
 
+  // ---- Lifecycle ------------------------------------------------------------
+
+  /**
+   * Initializes (or recovers) the controller. Called at every service-worker
+   * startup: it rehydrates session + queue and, if a crawl was active, resumes.
+   */
   async init(): Promise<void> {
     await this.sessionManager.init();
+    await this.hydrateScheduler();
+
+    const session = this.sessionManager.getSession();
+    if (session?.isRunning && !session.isPaused) {
+      this.logger.info('Active crawl detected on startup — resuming');
+      await this.ensureAlarm();
+      this.kickLoop();
+    }
     this.logger.info('CrawlController initialized');
   }
 
   async startCrawl(): Promise<ICrawlSession> {
     const session = this.sessionManager.startNewSession();
     this.scheduler.clear();
-    this.metrics.reset();
+    this.emptyScrolls = 0;
+    await this.persistScheduler();
 
-    // We'll broadcast this event externally
+    const pageUrl = await this.activeTabUrl();
+    this.diagnostics.reset(pageUrl);
+
+    await this.ensureAlarm();
     this.broadcastEvent('CRAWL_STARTED', { sessionId: session.sessionId });
 
-    this.startProcessingLoop();
+    // Kick discovery in the content script (DiscoveryEngine lives there).
+    await this.sendToActiveTab({ action: 'RUN_PIPELINE' }).catch(() => {});
+
+    this.kickLoop();
     return session;
   }
 
   async pauseCrawl(): Promise<void> {
-    await this.sessionManager.update({ isPaused: true });
-    this.stopProcessingLoop();
+    await this.sessionManager.update({ isPaused: true, navigationStatus: 'paused' });
+    this.stopLoop();
+    await this.clearAlarm();
     this.broadcastEvent('CRAWL_PAUSED', {});
   }
 
   async resumeCrawl(): Promise<void> {
-    await this.sessionManager.update({ isPaused: false });
-    this.startProcessingLoop();
+    await this.sessionManager.update({ isPaused: false, navigationStatus: 'idle' });
+    await this.ensureAlarm();
+    this.kickLoop();
     this.broadcastEvent('CRAWL_RESUMED', {});
   }
 
   async cancelCrawl(): Promise<void> {
-    await this.sessionManager.update({ isCancelled: true, isRunning: false });
-    this.stopProcessingLoop();
+    await this.sessionManager.update({
+      isCancelled: true,
+      isRunning: false,
+      navigationStatus: 'cancelled',
+    });
+    this.stopLoop();
+    await this.clearAlarm();
     this.scheduler.clear();
+    await this.persistScheduler();
     this.broadcastEvent('CRAWL_CANCELLED', {});
   }
+
+  private async finishCrawl(reason: string): Promise<void> {
+    const session = this.sessionManager.getSession();
+    await this.sessionManager.update({ isRunning: false, navigationStatus: `finished:${reason}` });
+    this.stopLoop();
+    await this.clearAlarm();
+    this.broadcastEvent('CRAWL_FINISHED', { sessionId: session?.sessionId ?? '', reason });
+    this.logger.info(`Crawl finished: ${reason}`);
+  }
+
+  // ---- Discovery intake -----------------------------------------------------
 
   async handleDiscoveryBatch(
     batch: Array<{ resource: IDiscoveredResource; fingerprint: string }>,
@@ -80,126 +155,314 @@ export class CrawlController {
     this.broadcastEvent('DISCOVERY_BATCH', { count: batch.length });
 
     for (const item of batch) {
-      // Default priority 0. Newest discovered items might get higher priority in future if we want LIFO
       const task = this.scheduler.enqueue(item.resource.targetUri, 0);
       if (task) {
-        await this.sessionManager.increment('discovered');
-        await this.sessionManager.increment('queued');
+        this.metrics.recordDiscovered();
+        this.metrics.recordQueued();
+        this.emptyScrolls = 0; // new work invalidates end-of-feed suspicion
         this.broadcastEvent('RESOURCE_QUEUED', {
           targetUri: task.targetUri,
           priority: task.priority,
         });
+      } else {
+        // Already tracked → duplicate discovery.
+        this.metrics.recordDuplicate();
       }
     }
+
+    this.metrics.observeQueueDepth(this.scheduler.getQueueDepth());
+    await this.persistScheduler();
+    await this.sessionManager.sync(this.scheduler.getQueueDepth());
+
+    // Ensure the loop is running to drain the new work.
+    if (session.isRunning && !session.isPaused) this.kickLoop();
   }
 
-  private startProcessingLoop(): void {
-    if (this.pollTimer) return;
-    this.pollTimer = setInterval(() => this.processNext(), 1000);
-  }
+  // ---- Processing loop (MV3-safe) ------------------------------------------
 
-  private stopProcessingLoop(): void {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
+  /** Called by the alarm watchdog to resume the loop after SW suspension. */
+  async resumeFromAlarm(): Promise<void> {
+    const session = this.sessionManager.getSession();
+    if (session?.isRunning && !session.isPaused && !this.loopTimer) {
+      this.logger.debug('Alarm watchdog resuming processing loop');
+      this.kickLoop();
     }
+  }
+
+  private kickLoop(): void {
+    if (this.loopTimer) return;
+    this.scheduleTick(0);
+  }
+
+  private scheduleTick(delay = CrawlController.TICK_MS): void {
+    this.loopTimer = setTimeout(() => {
+      this.loopTimer = null;
+      void this.tick();
+    }, delay);
+  }
+
+  private stopLoop(): void {
+    if (this.loopTimer) {
+      clearTimeout(this.loopTimer);
+      this.loopTimer = null;
+    }
+  }
+
+  private async tick(): Promise<void> {
+    const session = this.sessionManager.getSession();
+    if (!session || !session.isRunning || session.isPaused) return; // halt loop
+    await this.processNext();
+    const after = this.sessionManager.getSession();
+    if (after?.isRunning && !after.isPaused) this.scheduleTick();
   }
 
   private async processNext(): Promise<void> {
     if (this.isProcessing) return;
-    const session = this.sessionManager.getSession();
-    if (!session || !session.isRunning || session.isPaused) return;
 
     const task = this.scheduler.getNextTask();
     if (!task) {
-      // If we are out of tasks, maybe trigger navigation scroll?
-      // This will be orchestrated via Navigator later.
+      await this.handleQueueDrained();
       return;
     }
 
     this.isProcessing = true;
+    let stage: Stage = 'navigation';
     try {
-      await this.sessionManager.update({ currentResource: task.targetUri });
+      const tabId = await this.requireActiveTabId();
+
+      await this.sessionManager.update({
+        currentResource: task.targetUri,
+        navigationStatus: 'opening',
+      });
       this.broadcastEvent('NAVIGATION_STARTED', { targetUri: task.targetUri });
 
-      // PHASE 2: Coordinate with Navigator to open the resource
-      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (!tabs[0]?.id) throw new Error('No active tab');
-
-      const navResponse = await chrome.tabs.sendMessage(tabs[0].id, {
+      // --- Navigation ---
+      const navResponse = await this.sendToTab(tabId, {
         action: 'NAVIGATE_OPEN',
         data: { targetUri: task.targetUri },
       });
-
       if (!navResponse?.success) {
         throw new Error(navResponse?.error || 'Navigator failed to open resource');
       }
+      this.metrics.recordNavigation(Number(navResponse.openLatencyMs) || 0);
 
+      // --- Extraction ---
+      stage = 'extraction';
       this.scheduler.markExtracting(task.id);
+      await this.sessionManager.update({ navigationStatus: 'extracting' });
       this.broadcastEvent('EXTRACTION_STARTED', { targetUri: task.targetUri });
 
-      // Execute Extraction
       const extractStart = performance.now();
-      const extractResponse = await chrome.tabs.sendMessage(tabs[0].id, {
+      const extractResponse = (await this.sendToTab(tabId, {
         action: 'EXTRACT_RESOURCE',
         data: { targetUri: task.targetUri },
-      });
+      })) as ExtractResponse;
       const extractionDurationMs = performance.now() - extractStart;
 
       if (!extractResponse?.success) {
-        throw new Error(extractResponse?.error || 'Extraction failed');
+        throw new ExtractFailure(
+          extractResponse?.error || 'Extraction failed',
+          extractResponse?.domSnapshot,
+        );
+      }
+      this.metrics.recordExtracted(extractionDurationMs);
+      if (extractResponse.strategyName) {
+        this.diagnostics.recordStrategyUsed(extractResponse.strategyName);
       }
 
-      // Close resource (modal) after extraction
-      const closeResponse = await chrome.tabs.sendMessage(tabs[0].id, { action: 'NAVIGATE_CLOSE' });
+      // Close the modal (best-effort; not fatal).
+      await this.sendToTab(tabId, { action: 'NAVIGATE_CLOSE' }).catch(() => undefined);
 
-      await this.sessionManager.addMetrics({
-        modalOpenLatencyMs: navResponse.openLatencyMs,
-        domStabilizationTimeMs: navResponse.domStabilizeMs,
-        extractionDurationMs,
-        modalCloseDurationMs: closeResponse?.closeDurationMs,
-      });
-
-      // Execute Normalization
+      // --- Normalization ---
+      stage = 'normalization';
+      const normStart = performance.now();
       const normalized = await this.connector.normalize(
         extractResponse.data as Parameters<InstagramConnector['normalize']>[0],
       );
-      this.broadcastEvent('RESOURCE_NORMALIZED', normalized);
+      this.metrics.recordNormalized(performance.now() - normStart);
+      this.broadcastEvent('RESOURCE_NORMALIZED', { resourceId: normalized.id });
 
-      // Execute Persistence
+      // --- Persistence ---
       const tx = await this.storage.beginTransaction();
       await this.storage.saveResource(normalized, tx);
       await tx.commit();
+      this.metrics.recordPersisted();
       this.broadcastEvent('RESOURCE_PERSISTED', { resourceId: normalized.id });
 
       this.scheduler.markCompleted(task.id);
-      await this.sessionManager.increment('extracted');
+      this.emptyScrolls = 0;
       this.broadcastEvent('EXTRACTION_COMPLETED', {
         targetUri: task.targetUri,
-        resourceId: task.id,
+        resourceId: normalized.id,
       });
     } catch (err) {
-      const errorMsg = String(err);
-      const updatedTask = this.scheduler.markFailed(task.id, errorMsg);
-      if (updatedTask?.state === 'failed') {
-        await this.sessionManager.increment('failed');
-      }
-      await this.sessionManager.increment('totalRetries');
-      this.broadcastEvent('RESOURCE_FAILED', { targetUri: task.targetUri, reason: errorMsg });
+      await this.handleTaskFailure(task, stage, err);
     } finally {
       this.isProcessing = false;
-      // Clear the "currently processing" marker. Empty string = none
-      // (exactOptionalPropertyTypes forbids assigning explicit `undefined`).
-      await this.sessionManager.update({ currentResource: '' });
+      this.metrics.observeQueueDepth(this.scheduler.getQueueDepth());
+      await this.persistScheduler();
+      await this.sessionManager.update({ currentResource: '', navigationStatus: 'idle' });
+      await this.sessionManager.sync(this.scheduler.getQueueDepth());
     }
   }
 
+  /** Records a failure across metrics + diagnostics and applies the retry policy. */
+  private async handleTaskFailure(task: ICrawlTask, stage: Stage, err: unknown): Promise<void> {
+    const message = err instanceof Error ? err.message : String(err);
+    const domSnapshot = err instanceof ExtractFailure ? err.domSnapshot : undefined;
+
+    // Stage-specific failure counters.
+    if (stage === 'navigation') this.metrics.recordNavigationFailure();
+    else if (stage === 'extraction') this.metrics.recordExtractionFailure();
+    else this.metrics.recordNormalizationFailure();
+
+    // Apply retry policy (exponential backoff lives in the Scheduler).
+    const updated = this.scheduler.markFailed(task.id, message);
+    const permanent = updated?.state === 'failed';
+    if (permanent) {
+      this.metrics.recordFailurePermanent();
+    } else {
+      this.metrics.recordRetry();
+    }
+
+    // Every failure is recorded to diagnostics with full context.
+    this.diagnostics.recordFailure(task.targetUri, this.categoryFor(stage), message, {
+      errorDetail: message,
+      ...(domSnapshot ? { domSnapshot } : {}),
+      failingStrategy: stage,
+    });
+
+    this.broadcastEvent('RESOURCE_FAILED', {
+      targetUri: task.targetUri,
+      reason: message,
+      stage,
+      permanent,
+    });
+  }
+
+  private categoryFor(stage: Stage): FailureCategory {
+    if (stage === 'navigation') return 'selector_failure';
+    if (stage === 'extraction') return 'parsing_failure';
+    return 'normalization_failure';
+  }
+
+  /** Drives infinite scroll when the queue empties; terminates at end-of-feed. */
+  private async handleQueueDrained(): Promise<void> {
+    if (!this.scheduler.isDrained()) return; // tasks still mid-flight
+
+    if (this.emptyScrolls >= CrawlController.MAX_EMPTY_SCROLLS) {
+      await this.finishCrawl('feed-exhausted');
+      return;
+    }
+
+    const tabId = await this.activeTabId();
+    if (tabId === null) {
+      await this.finishCrawl('no-active-tab');
+      return;
+    }
+
+    await this.sessionManager.update({ navigationStatus: 'scrolling' });
+    const scroll = await this.sendToTab(tabId, { action: 'NAVIGATE_SCROLL' }).catch(() => null);
+
+    if (!scroll || scroll.success === false) {
+      // Navigator reports no new height → bottom of the feed.
+      await this.finishCrawl('end-of-feed');
+      return;
+    }
+
+    // Scroll succeeded; new content (if any) arrives via RESOURCES_DISCOVERED.
+    // If repeated scrolls yield no new work, emptyScrolls trips end-of-feed.
+    this.emptyScrolls++;
+  }
+
+  // ---- Persistence helpers --------------------------------------------------
+
+  private async persistScheduler(): Promise<void> {
+    await chrome.storage.session.set({
+      [CrawlController.SCHED_KEY]: this.scheduler.snapshot(),
+    });
+  }
+
+  private async hydrateScheduler(): Promise<void> {
+    const data = await chrome.storage.session.get(CrawlController.SCHED_KEY);
+    const tasks = data[CrawlController.SCHED_KEY] as ICrawlTask[] | undefined;
+    if (tasks && tasks.length > 0) {
+      this.scheduler.restore(tasks);
+      this.metrics.observeQueueDepth(this.scheduler.getQueueDepth());
+    }
+  }
+
+  // ---- Public accessors (for the message dispatcher) ------------------------
+
+  getSession(): ICrawlSession | null {
+    return this.sessionManager.getSession();
+  }
+
+  exportDiagnostics(): ISessionReport {
+    return this.diagnostics.buildReport(this.metrics.snapshot());
+  }
+
+  // ---- Chrome glue ----------------------------------------------------------
+
+  private async ensureAlarm(): Promise<void> {
+    await chrome.alarms.create(CrawlController.ALARM_NAME, { periodInMinutes: 1 });
+  }
+
+  private async clearAlarm(): Promise<void> {
+    await chrome.alarms.clear(CrawlController.ALARM_NAME);
+  }
+
+  private async activeTabId(): Promise<number | null> {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    return tabs[0]?.id ?? null;
+  }
+
+  private async requireActiveTabId(): Promise<number> {
+    const id = await this.activeTabId();
+    if (id === null) throw new Error('No active tab');
+    return id;
+  }
+
+  private async activeTabUrl(): Promise<string> {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    return tabs[0]?.url ?? '';
+  }
+
+  private async sendToActiveTab(message: unknown): Promise<NavResponse> {
+    const id = await this.requireActiveTabId();
+    return this.sendToTab(id, message);
+  }
+
+  private async sendToTab(tabId: number, message: unknown): Promise<NavResponse> {
+    return (await chrome.tabs.sendMessage(tabId, message)) as NavResponse;
+  }
+
   private broadcastEvent(action: string, payload: unknown): void {
-    // Also log internally
     this.logger.debug(`[EVENT] ${action}`, payload);
-    // Push to extension messaging
     chrome.runtime
       .sendMessage({ action: 'SYSTEM_STATUS', data: { stage: action, payload } })
       .catch(() => {});
+  }
+}
+
+/** Loose response shape for content-script messages (navigation/scroll/etc.). */
+interface NavResponse {
+  success?: boolean;
+  error?: string;
+  openLatencyMs?: number;
+  domStabilizeMs?: number;
+  closeDurationMs?: number;
+  stabilizeMs?: number;
+  [key: string]: unknown;
+}
+
+/** Carries the failure DOM snapshot from the extraction stage to diagnostics. */
+class ExtractFailure extends Error {
+  constructor(
+    message: string,
+    public readonly domSnapshot?: string,
+  ) {
+    super(message);
+    this.name = 'ExtractFailure';
   }
 }

@@ -1,5 +1,8 @@
 /**
  * Background Worker — Pipeline Orchestrator (Alpha Diagnostic Build)
+ *
+ * MV3 service worker: all event listeners are registered synchronously at the
+ * top level so the worker can be revived by Chrome and resume an active crawl.
  */
 import { Logger, MetricsCollector, DiagnosticsCollector } from '@knowledge-extractor/shared';
 import { IDiscoveredResource } from '@knowledge-extractor/types';
@@ -14,11 +17,18 @@ const connector = new InstagramConnector();
 const storage = new InMemoryStorage();
 const controller = new CrawlController(metrics, diagnostics, connector, storage);
 
-// Initialize controller and session
+// Initialize/recover controller and session on every worker startup.
 controller.init().catch((err) => logger.error('Failed to init controller', err));
 
+// ---- Watchdog: resume the processing loop after SW suspension ---------------
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === CrawlController.ALARM_NAME) {
+    controller.resumeFromAlarm().catch((err) => logger.error('Alarm resume failed', err));
+  }
+});
+
 // ---- Message Dispatcher -----------------------------------------------------
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.action === 'START_PIPELINE') {
     controller
       .startCrawl()
@@ -43,9 +53,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.action === 'GET_SESSION') {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const sessionManager = (controller as any).sessionManager;
-    sendResponse(sessionManager?.getSession() || null);
+    sendResponse(controller.getSession());
     return false;
   }
 
@@ -59,8 +67,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.action === 'EXPORT_DIAGNOSTICS') {
-    const report = diagnostics.buildReport(metrics.snapshot());
-    sendResponse(report);
+    sendResponse(controller.exportDiagnostics());
     return false;
   }
 
