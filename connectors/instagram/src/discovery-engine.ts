@@ -1,4 +1,4 @@
-import { IDiscoveredResource } from '@knowledge-extractor/types';
+import { IDiscoveredResource, IResourceFingerprint } from '@knowledge-extractor/types';
 import { Logger } from '@knowledge-extractor/shared';
 import { ResourceFingerprinter } from './fingerprinter.js';
 
@@ -96,7 +96,10 @@ export class DiscoveryEngine {
     const authorEl = contextEl.querySelector<HTMLAnchorElement>('header a');
     const imgs = contextEl.querySelectorAll('img');
 
-    const fpInput: any = { sourceUri: cleanUri, mediaCount: imgs.length };
+    const fpInput: IResourceFingerprint['inputs'] = {
+      sourceUri: cleanUri,
+      mediaCount: imgs.length,
+    };
     const authorHandle = authorEl?.textContent?.trim();
     if (authorHandle) fpInput.authorHandle = authorHandle;
     const captionPreview = contextEl.querySelector('h1, span')?.textContent?.slice(0, 64);

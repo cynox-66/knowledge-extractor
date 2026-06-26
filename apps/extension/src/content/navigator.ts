@@ -42,9 +42,7 @@ export class Navigator {
    * Attempts to open the resource specified by targetUri in the current tab.
    * Uses Option A (Modal navigation) for grid items.
    */
-  async openResource(
-    targetUri: string,
-  ): Promise<{
+  async openResource(targetUri: string): Promise<{
     success: boolean;
     openLatencyMs?: number;
     domStabilizeMs?: number;

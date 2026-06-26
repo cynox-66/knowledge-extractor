@@ -63,4 +63,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse(report);
     return false;
   }
+
+  return false;
 });

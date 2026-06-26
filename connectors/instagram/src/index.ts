@@ -1,4 +1,4 @@
-import { IResource } from '@knowledge-extractor/types';
+import { IConnector, IResource } from '@knowledge-extractor/types';
 import { Logger } from '@knowledge-extractor/shared';
 import { StrategyChain } from './strategy-chain.js';
 import { InstagramParser, InstagramNormalizer } from './parser.js';
@@ -8,22 +8,26 @@ import {
   StructuralHeuristicStrategy,
   ArticleElement,
 } from './strategies.js';
-import { IInstagramParsedPost } from '@knowledge-extractor/types';
+import { IInstagramParsedPost } from './types.js';
 
 export { DiscoveryEngine } from './discovery-engine.js';
 export { ResourceFingerprinter } from './fingerprinter.js';
+export type { IInstagramParsedPost, InstagramPostLayout } from './types.js';
 
 /**
- * The Instagram Connector — public entry point.
+ * The Instagram Connector — public entry point and the single runtime
+ * extraction implementation for Instagram.
  *
  * Architecture:
- *   DOM Adapter (Content Script)
- *     → DiscoveryEngine (this package)
- *       → StrategyChain [Semantic → DataAttr → Heuristic]
- *         → InstagramParser (Instagram semantics)
- *           → InstagramNormalizer (domain contracts)
+ *   DOM Adapter (Content Script) — provides the raw `<article>` Element only
+ *     → InstagramConnector.extract()  [StrategyChain → InstagramParser.enrich]
+ *       → IInstagramParsedPost (raw, Instagram-shaped)
+ *         → InstagramConnector.normalize()  [InstagramNormalizer → IResource]
+ *
+ * Extraction (DOM → raw) runs where the DOM lives (content script); normalization
+ * (raw → domain) is pure and may run anywhere (today: background worker).
  */
-export class InstagramConnector {
+export class InstagramConnector implements IConnector<IInstagramParsedPost> {
   public readonly providerName = 'instagram';
 
   private readonly logger = new Logger('InstagramConnector');
@@ -35,21 +39,40 @@ export class InstagramConnector {
   private readonly normalizer = new InstagramNormalizer();
 
   /**
-   * Extracts and normalizes an Instagram article element into a domain resource.
-   * @param article A DOM `<article>` element from the Instagram page.
+   * Validates whether this connector can handle the given URI.
    */
-  async extractArticle(article: Element): Promise<IResource> {
-    this.logger.debug('Extracting article');
-    const raw = this.chain.execute(article);
-    const enriched = this.parser.enrich(raw);
-    return this.normalizer.normalize(enriched);
+  canHandle(uri: string): boolean {
+    return /(^|\.)instagram\.com$/.test(this.hostOf(uri)) || /\/(p|reel)\//.test(uri);
   }
 
   /**
-   * Normalizes a pre-parsed `IInstagramParsedPost` (for use with fixtures/tests).
+   * Extracts a raw, Instagram-shaped record from a DOM `<article>` element.
+   * This is the single runtime extraction path: StrategyChain → Parser.enrich.
+   * Throws `PlatformError` (PARSE_ERROR) if every strategy is exhausted.
+   *
+   * @param article A DOM `<article>` element from the Instagram page.
+   */
+  extract(article: ArticleElement): IInstagramParsedPost {
+    this.logger.debug('Extracting article via strategy chain');
+    const raw = this.chain.execute(article);
+    return this.parser.enrich(raw);
+  }
+
+  /**
+   * Normalizes a raw `IInstagramParsedPost` into the strict domain `IResource`.
+   * Idempotent re-enrichment guards against callers passing un-enriched records
+   * (e.g. fixtures/tests that build the raw shape directly).
    */
   async normalize(post: IInstagramParsedPost): Promise<IResource> {
     const enriched = this.parser.enrich(post);
     return this.normalizer.normalize(enriched);
+  }
+
+  private hostOf(uri: string): string {
+    try {
+      return new URL(uri).host;
+    } catch {
+      return '';
+    }
   }
 }

@@ -63,7 +63,7 @@ describe('Instagram Connector — Fixture Regression Tests', () => {
     assertResource(resource, expected);
     expect(resource.media.length).toBe(3);
     expect(resource.children?.length).toBe(3);
-    resource.children?.forEach((child: any) => {
+    resource.children?.forEach((child) => {
       expect(child.kind).toBe('instagram-slide');
     });
   });
@@ -79,7 +79,7 @@ describe('Instagram Connector — Fixture Regression Tests', () => {
     const resource = await connector.normalize(stratResult.data!);
     assertResource(resource, expected);
     expect(resource.kind).toBe('instagram-reel');
-    const videoMedia = resource.media.find((m: any) => m.type === 'video');
+    const videoMedia = resource.media.find((m) => m.type === 'video');
     expect(videoMedia).toBeDefined();
   });
 

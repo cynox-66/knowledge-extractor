@@ -188,7 +188,9 @@ export class CrawlController {
       this.broadcastEvent('RESOURCE_FAILED', { targetUri: task.targetUri, reason: errorMsg });
     } finally {
       this.isProcessing = false;
-      await this.sessionManager.update({ currentResource: undefined });
+      // Clear the "currently processing" marker. Empty string = none
+      // (exactOptionalPropertyTypes forbids assigning explicit `undefined`).
+      await this.sessionManager.update({ currentResource: '' });
     }
   }
 

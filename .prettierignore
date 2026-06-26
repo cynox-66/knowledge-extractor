@@ -3,7 +3,5 @@ dist/
 lib/
 .turbo/
 coverage/
-.env
-.env.local
-*.log
-.DS_Store
+.claude/
+pnpm-lock.yaml

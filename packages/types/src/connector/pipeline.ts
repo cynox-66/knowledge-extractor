@@ -1,5 +1,3 @@
-import { IResource } from '../core/resource.js';
-
 /**
  * Stage 1: Discovery.
  * Represents a resource that is known to exist but whose full content has not been extracted.
@@ -23,14 +21,4 @@ export interface IRawSourceResource {
   mediaUris: string[];
   publishedAt?: string;
   metadata?: Record<string, unknown>;
-}
-
-/**
- * Stage 3: Normalization.
- * The standard interface every provider-specific connector must implement to
- * map raw extracted data into the strict Domain Model.
- */
-export interface IConnector {
-  readonly providerName: string;
-  normalize(raw: IRawSourceResource): Promise<IResource>;
 }

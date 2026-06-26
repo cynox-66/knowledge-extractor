@@ -3,12 +3,7 @@
   "references": [
     { "path": "./packages/types" },
     { "path": "./packages/shared" },
-    { "path": "./packages/utils" },
-    { "path": "./packages/extractor" },
     { "path": "./packages/storage" },
-    { "path": "./packages/exporters" },
-    { "path": "./packages/ocr" },
-    { "path": "./packages/ai" },
     { "path": "./connectors/instagram" },
     { "path": "./apps/extension" }
   ]

@@ -1,8 +1,5 @@
-import {
-  IExtractionStrategy,
-  IStrategyResult,
-  IInstagramParsedPost,
-} from '@knowledge-extractor/types';
+import { IExtractionStrategy, IStrategyResult } from '@knowledge-extractor/types';
+import { IInstagramParsedPost } from './types.js';
 
 export type ArticleElement = Element;
 

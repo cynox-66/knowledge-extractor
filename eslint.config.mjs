@@ -25,6 +25,9 @@ export default tseslint.config(
       '**/node_modules/**',
       '.turbo/**',
       'coverage/**',
+      '**/*.config.{js,mjs,cjs,ts}',
+      '.dependency-cruiser.js',
+      '.lintstagedrc.json',
     ],
   }
 );

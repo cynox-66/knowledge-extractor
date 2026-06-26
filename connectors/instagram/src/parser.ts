@@ -1,11 +1,6 @@
-import {
-  IInstagramParsedPost,
-  IResource,
-  ResourceState,
-  MediaType,
-  BlockType,
-} from '@knowledge-extractor/types';
+import { IResource, IMedia, ResourceState, MediaType, BlockType } from '@knowledge-extractor/types';
 import { Logger } from '@knowledge-extractor/shared';
+import { IInstagramParsedPost } from './types.js';
 
 /**
  * The Instagram Parser understands Instagram-specific DOM and structured data.
@@ -50,13 +45,31 @@ export class InstagramNormalizer {
   normalize(post: IInstagramParsedPost): IResource {
     this.logger.info(`Normalizing post: ${post.externalId}`);
 
-    const media = post.mediaUris.map((uri, idx) => ({
+    const media: IMedia[] = post.mediaUris.map((uri, idx) => ({
       id: `${post.externalId}_media_${idx}`,
       type: post.videoUri === uri ? MediaType.VIDEO : MediaType.IMAGE,
       sourceUri: uri,
     }));
 
-    const result: any = {
+    const children: IResource[] =
+      post.layout === 'carousel'
+        ? (post.slideUris ?? post.mediaUris).map((uri, idx) => ({
+            id: `ig_${post.externalId}_slide_${idx}`,
+            kind: 'instagram-slide',
+            state: ResourceState.EXTRACTED,
+            completeness: { thumbnail: true, metadata: true, media: true, ocr: false },
+            source: {
+              providerName: 'instagram',
+              externalId: `${post.externalId}_slide_${idx}`,
+              originalUri: post.sourceUri,
+              extractedAt: new Date().toISOString(),
+            },
+            content: [],
+            media: [{ id: `slide_media_${idx}`, type: MediaType.IMAGE, sourceUri: uri }],
+          }))
+        : [];
+
+    const result: IResource = {
       id: `ig_${post.externalId || this.djb2(post.sourceUri)}`,
       kind: post.layout === 'reel' ? 'instagram-reel' : 'instagram-post',
       state: ResourceState.EXTRACTED,
@@ -70,31 +83,16 @@ export class InstagramNormalizer {
       },
       content: post.textContent ? [{ type: BlockType.TEXT, value: post.textContent }] : [],
       media,
-      children:
-        post.layout === 'carousel'
-          ? (post.slideUris ?? post.mediaUris).map((uri, idx) => ({
-              id: `ig_${post.externalId}_slide_${idx}`,
-              kind: 'instagram-slide',
-              state: ResourceState.EXTRACTED,
-              completeness: { thumbnail: true, metadata: true, media: true, ocr: false },
-              source: {
-                providerName: 'instagram',
-                externalId: `${post.externalId}_slide_${idx}`,
-                originalUri: post.sourceUri,
-                extractedAt: new Date().toISOString(),
-              },
-              content: [],
-              media: [{ id: `slide_media_${idx}`, type: MediaType.IMAGE, sourceUri: uri }],
-            }))
-          : [],
+      children,
+      ...(post.authorHandle
+        ? {
+            author: {
+              handle: post.authorHandle,
+              ...(post.authorDisplayName ? { displayName: post.authorDisplayName } : {}),
+            },
+          }
+        : {}),
     };
-
-    if (post.authorHandle) {
-      result.author = {
-        handle: post.authorHandle,
-        ...(post.authorDisplayName ? { displayName: post.authorDisplayName } : {}),
-      };
-    }
 
     return result;
   }
