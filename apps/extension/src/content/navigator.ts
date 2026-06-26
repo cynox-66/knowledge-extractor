@@ -9,9 +9,9 @@ export class Navigator {
 
   /**
    * Scrolls the window down by one viewport height and waits for dynamic content to load.
-   * @returns true if scroll was successful, false if end of page was reached.
    */
-  async scrollGrid(): Promise<boolean> {
+  async scrollGrid(): Promise<{ success: boolean; stabilizeMs?: number }> {
+    const start = performance.now();
     const previousHeight = document.documentElement.scrollHeight;
 
     // Scroll down by 80% of viewport height to trigger lazy load but keep some overlap
@@ -31,18 +31,25 @@ export class Navigator {
       await this.sleep(1000);
       if (document.documentElement.scrollHeight === previousHeight) {
         this.logger.info('Reached end of grid (no new height after scroll)');
-        return false;
+        return { success: false, stabilizeMs: performance.now() - start };
       }
     }
 
-    return true;
+    return { success: true, stabilizeMs: performance.now() - start };
   }
 
   /**
    * Attempts to open the resource specified by targetUri in the current tab.
    * Uses Option A (Modal navigation) for grid items.
    */
-  async openResource(targetUri: string): Promise<boolean> {
+  async openResource(
+    targetUri: string,
+  ): Promise<{
+    success: boolean;
+    openLatencyMs?: number;
+    domStabilizeMs?: number;
+    error?: string;
+  }> {
     // 1. Try to find the thumbnail link in the grid
     const links = Array.from(
       document.querySelectorAll<HTMLAnchorElement>('a[href*="/p/"], a[href*="/reel/"]'),
@@ -59,20 +66,25 @@ export class Navigator {
       await this.sleep(100);
 
       // We dispatch a click event
+      const clickTime = performance.now();
       targetLink.click();
 
       // Wait for the modal article to appear
       const modalLoaded = await this.waitForSelector('article[role="presentation"]', 5000);
+      const openLatencyMs = performance.now() - clickTime;
+
       if (!modalLoaded) {
         this.logger.warn(`Modal failed to load for ${targetUri}`);
         // Attempt to close if it's stuck half-open
         await this.closeResource();
-        return false;
+        return { success: false, openLatencyMs, error: 'Modal timeout' };
       }
 
       // Give it a brief moment for dynamic content (images, video) to hydrate
+      const stabilizeStart = performance.now();
       await this.sleep(500);
-      return true;
+      const domStabilizeMs = performance.now() - stabilizeStart;
+      return { success: true, openLatencyMs, domStabilizeMs };
     }
 
     // 2. If no link is found, we might already be on a feed/detail page where the article is fully loaded
@@ -84,18 +96,24 @@ export class Navigator {
     if (article) {
       this.logger.debug(`Resource already open in feed for ${targetUri}`);
       article.scrollIntoView({ block: 'center', behavior: 'instant' });
+      const stabilizeStart = performance.now();
       await this.sleep(200);
-      return true;
+      return {
+        success: true,
+        openLatencyMs: 0,
+        domStabilizeMs: performance.now() - stabilizeStart,
+      };
     }
 
     this.logger.error(`Could not locate resource in DOM to open: ${targetUri}`);
-    return false;
+    return { success: false, error: 'Not found in DOM' };
   }
 
   /**
    * Closes the currently open modal (if any).
    */
-  async closeResource(): Promise<void> {
+  async closeResource(): Promise<{ success: boolean; closeDurationMs?: number }> {
+    const start = performance.now();
     // Instagram modal close button usually has an SVG with aria-label "Close"
     const closeBtn =
       document.querySelector<HTMLButtonElement>('svg[aria-label="Close"]')?.closest('button') ||
@@ -105,6 +123,7 @@ export class Navigator {
       this.logger.debug('Clicking close button on modal');
       closeBtn.click();
       await this.sleep(300); // Wait for modal to animate out
+      return { success: true, closeDurationMs: performance.now() - start };
     } else {
       // Fallback: If there's a dialog but no close button, try pressing Escape
       const dialog = document.querySelector('div[role="dialog"]');
@@ -112,8 +131,10 @@ export class Navigator {
         this.logger.debug('No close button found, dispatching Escape key');
         document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
         await this.sleep(300);
+        return { success: true, closeDurationMs: performance.now() - start };
       }
     }
+    return { success: true, closeDurationMs: 0 };
   }
 
   private sleep(ms: number): Promise<void> {

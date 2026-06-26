@@ -132,24 +132,33 @@ export class CrawlController {
       });
 
       if (!navResponse?.success) {
-        throw new Error('Navigator failed to open resource');
+        throw new Error(navResponse?.error || 'Navigator failed to open resource');
       }
 
       this.scheduler.markExtracting(task.id);
       this.broadcastEvent('EXTRACTION_STARTED', { targetUri: task.targetUri });
 
       // Execute Extraction
+      const extractStart = performance.now();
       const extractResponse = await chrome.tabs.sendMessage(tabs[0].id, {
         action: 'EXTRACT_RESOURCE',
         data: { targetUri: task.targetUri },
       });
+      const extractionDurationMs = performance.now() - extractStart;
 
       if (!extractResponse?.success) {
         throw new Error(extractResponse?.error || 'Extraction failed');
       }
 
       // Close resource (modal) after extraction
-      await chrome.tabs.sendMessage(tabs[0].id, { action: 'NAVIGATE_CLOSE' });
+      const closeResponse = await chrome.tabs.sendMessage(tabs[0].id, { action: 'NAVIGATE_CLOSE' });
+
+      await this.sessionManager.addMetrics({
+        modalOpenLatencyMs: navResponse.openLatencyMs,
+        domStabilizationTimeMs: navResponse.domStabilizeMs,
+        extractionDurationMs,
+        modalCloseDurationMs: closeResponse?.closeDurationMs,
+      });
 
       // Execute Normalization
       const normalized = await this.connector.normalize(
@@ -175,6 +184,7 @@ export class CrawlController {
       if (updatedTask?.state === 'failed') {
         await this.sessionManager.increment('failed');
       }
+      await this.sessionManager.increment('totalRetries');
       this.broadcastEvent('RESOURCE_FAILED', { targetUri: task.targetUri, reason: errorMsg });
     } finally {
       this.isProcessing = false;

@@ -47,7 +47,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     const { targetUri } = (message.data ?? {}) as { targetUri: string };
     navigator
       .openResource(targetUri)
-      .then((success) => sendResponse({ success }))
+      .then((result) => sendResponse(result))
       .catch((err) => sendResponse({ success: false, error: String(err) }));
     return true;
   }
@@ -55,7 +55,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.action === 'NAVIGATE_CLOSE') {
     navigator
       .closeResource()
-      .then(() => sendResponse({ success: true }))
+      .then((result) => sendResponse(result))
       .catch((err) => sendResponse({ success: false, error: String(err) }));
     return true;
   }
@@ -63,7 +63,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.action === 'NAVIGATE_SCROLL') {
     navigator
       .scrollGrid()
-      .then((success) => sendResponse({ success }))
+      .then((result) => sendResponse(result))
       .catch((err) => sendResponse({ success: false, error: String(err) }));
     return true;
   }

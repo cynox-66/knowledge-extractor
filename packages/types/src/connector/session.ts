@@ -62,4 +62,13 @@ export interface ICrawlSession {
   isRunning: boolean;
   isPaused: boolean;
   isCancelled: boolean;
+
+  // Advanced Diagnostics
+  totalModalOpenLatencyMs: number;
+  totalDomStabilizationTimeMs: number;
+  totalExtractionDurationMs: number;
+  totalModalCloseDurationMs: number;
+  totalRetries: number;
+  scrollFailures: number;
+  selectorFailures: number;
 }

@@ -39,9 +39,37 @@ export class SessionManager {
     await this.persist();
   }
 
-  async increment(field: 'discovered' | 'queued' | 'extracted' | 'failed', by = 1): Promise<void> {
+  async increment(
+    field:
+      | 'discovered'
+      | 'queued'
+      | 'extracted'
+      | 'failed'
+      | 'totalRetries'
+      | 'scrollFailures'
+      | 'selectorFailures',
+    by = 1,
+  ): Promise<void> {
     if (!this.session) return;
     this.session[field] += by;
+    await this.persist();
+  }
+
+  async addMetrics(metrics: {
+    modalOpenLatencyMs?: number;
+    domStabilizationTimeMs?: number;
+    extractionDurationMs?: number;
+    modalCloseDurationMs?: number;
+  }): Promise<void> {
+    if (!this.session) return;
+    if (metrics.modalOpenLatencyMs)
+      this.session.totalModalOpenLatencyMs += metrics.modalOpenLatencyMs;
+    if (metrics.domStabilizationTimeMs)
+      this.session.totalDomStabilizationTimeMs += metrics.domStabilizationTimeMs;
+    if (metrics.extractionDurationMs)
+      this.session.totalExtractionDurationMs += metrics.extractionDurationMs;
+    if (metrics.modalCloseDurationMs)
+      this.session.totalModalCloseDurationMs += metrics.modalCloseDurationMs;
     await this.persist();
   }
 
@@ -56,6 +84,13 @@ export class SessionManager {
       isRunning: false,
       isPaused: false,
       isCancelled: false,
+      totalModalOpenLatencyMs: 0,
+      totalDomStabilizationTimeMs: 0,
+      totalExtractionDurationMs: 0,
+      totalModalCloseDurationMs: 0,
+      totalRetries: 0,
+      scrollFailures: 0,
+      selectorFailures: 0,
     };
   }
 
