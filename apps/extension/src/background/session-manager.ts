@@ -3,10 +3,11 @@ import { Logger, MetricsCollector } from '@knowledge-extractor/shared';
 
 /**
  * Single source of truth for crawl state. Persists `ICrawlSession` to
- * `chrome.storage.session` so it survives popup closure and service-worker
- * suspension, and broadcasts `SESSION_UPDATED` so the (stateless) Popup can
- * live-render. All numeric counters are sourced from `MetricsCollector`; this
- * class does not maintain its own.
+ * `chrome.storage.local` so it survives popup closure, service-worker
+ * suspension, **and full browser restart** (Beta-0 Phase 3), and broadcasts
+ * `SESSION_UPDATED` so the (stateless) Popup can live-render. All numeric
+ * counters are sourced from `MetricsCollector`; this class does not maintain
+ * its own.
  */
 export class SessionManager {
   private readonly logger = new Logger('SessionManager');
@@ -17,10 +18,10 @@ export class SessionManager {
 
   /**
    * Loads any persisted session. If one exists, its metrics snapshot is used to
-   * rehydrate the canonical `MetricsCollector` so counters survive SW restart.
+   * rehydrate the canonical `MetricsCollector` so counters survive restart.
    */
   async init(): Promise<void> {
-    const data = await chrome.storage.session.get(this.STORAGE_KEY);
+    const data = await chrome.storage.local.get(this.STORAGE_KEY);
     const stored = data[this.STORAGE_KEY] as ICrawlSession | undefined;
     if (stored) {
       this.session = stored;
@@ -80,7 +81,7 @@ export class SessionManager {
   private async persist(): Promise<void> {
     if (!this.session) return;
     this.session.metrics = this.metrics.snapshot();
-    await chrome.storage.session.set({ [this.STORAGE_KEY]: this.session });
+    await chrome.storage.local.set({ [this.STORAGE_KEY]: this.session });
     // Broadcast to any open popups (ignored if none are listening).
     chrome.runtime.sendMessage({ action: 'SESSION_UPDATED', data: this.session }).catch(() => {});
   }

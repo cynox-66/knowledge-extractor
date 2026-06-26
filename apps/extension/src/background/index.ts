@@ -1,24 +1,84 @@
 /**
- * Background Worker — Pipeline Orchestrator (Alpha Diagnostic Build)
+ * Background Worker — Composition Root.
+ *
+ * This module is the ONLY place that constructs infrastructure (storage engine,
+ * media store, metrics, diagnostics, connector, controller). Every subsystem
+ * receives its dependencies by constructor injection; controllers never build
+ * infrastructure themselves.
  *
  * MV3 service worker: all event listeners are registered synchronously at the
- * top level so the worker can be revived by Chrome and resume an active crawl.
+ * top level (before any `await`) so the revived worker never misses an event.
+ * Asynchronous startup (persistence request + recovery) runs afterwards.
  */
 import { Logger, MetricsCollector, DiagnosticsCollector } from '@knowledge-extractor/shared';
-import { IDiscoveredResource } from '@knowledge-extractor/types';
+import { IDiscoveredResource, IStorageEngine, IMediaStore } from '@knowledge-extractor/types';
 import { CrawlController } from './crawl-controller.js';
 import { InstagramConnector } from '@knowledge-extractor/connector-instagram';
-import { InMemoryStorage } from '@knowledge-extractor/storage';
+import {
+  IndexedDbStorageEngine,
+  InMemoryStorage,
+  MediaStore,
+  OpfsBlobBackend,
+  InMemoryBlobBackend,
+} from '@knowledge-extractor/storage';
 
 const logger = new Logger('BackgroundWorker');
 const metrics = new MetricsCollector();
 const diagnostics = new DiagnosticsCollector();
 const connector = new InstagramConnector();
-const storage = new InMemoryStorage();
-const controller = new CrawlController(metrics, diagnostics, connector, storage);
 
-// Initialize/recover controller and session on every worker startup.
-controller.init().catch((err) => logger.error('Failed to init controller', err));
+// Durable resource storage. IndexedDB is the default; in the rare environment
+// where it is unavailable, degrade to volatile in-memory storage (with a clear
+// warning) so the crawler still functions — persistence failures then surface
+// as recorded task failures rather than silent data loss.
+const storage: IStorageEngine =
+  typeof indexedDB !== 'undefined' ? new IndexedDbStorageEngine() : new InMemoryStorage();
+if (typeof indexedDB === 'undefined') {
+  logger.warn('IndexedDB unavailable — using volatile in-memory storage');
+}
+
+// Durable media store (bytes in OPFS). Falls back to a volatile in-memory blob
+// backend where OPFS is unavailable. Owned here; consumed by later phases.
+const mediaStore: IMediaStore = new MediaStore(
+  OpfsBlobBackend.isSupported() ? new OpfsBlobBackend() : new InMemoryBlobBackend(),
+);
+if (!OpfsBlobBackend.isSupported()) {
+  logger.warn('OPFS unavailable — media store using volatile in-memory backend');
+}
+
+const controller = new CrawlController(metrics, diagnostics, connector, storage, mediaStore);
+
+/** Requests durable (non-evictable) storage. Best-effort; safe if unsupported. */
+async function requestPersistence(): Promise<void> {
+  try {
+    if (typeof navigator !== 'undefined' && navigator.storage?.persist) {
+      const granted = await navigator.storage.persist();
+      logger.info(`Persistent storage ${granted ? 'granted' : 'denied'}`);
+    } else {
+      logger.warn('navigator.storage.persist() unavailable');
+    }
+  } catch (err) {
+    logger.warn('Persistence request failed', err);
+  }
+}
+
+/** Async startup: request persistence, probe storage, then recover state. */
+async function startup(): Promise<void> {
+  await requestPersistence();
+  // Probe durable storage so a hard failure (quota/corruption) is visible in
+  // diagnostics instead of silently failing every later persistence.
+  try {
+    await storage.getResourceById('__startup_probe__');
+  } catch (err) {
+    logger.error('Durable storage probe failed — resources may not persist', err);
+    diagnostics.recordFailure('storage', 'unknown', 'Durable storage unavailable at startup', {
+      errorDetail: String(err),
+    });
+  }
+  await controller.init();
+}
+
+startup().catch((err) => logger.error('Startup failed', err));
 
 // ---- Watchdog: resume the processing loop after SW suspension ---------------
 chrome.alarms.onAlarm.addListener((alarm) => {

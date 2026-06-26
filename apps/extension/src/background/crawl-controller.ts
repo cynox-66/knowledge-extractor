@@ -1,13 +1,19 @@
-import { Logger, MetricsCollector, DiagnosticsCollector } from '@knowledge-extractor/shared';
+import {
+  Logger,
+  MetricsCollector,
+  DiagnosticsCollector,
+  IDiagnosticsState,
+} from '@knowledge-extractor/shared';
 import {
   IDiscoveredResource,
   ICrawlSession,
   ISessionReport,
   FailureCategory,
   ICrawlTask,
+  IStorageEngine,
+  IMediaStore,
 } from '@knowledge-extractor/types';
 import { InstagramConnector } from '@knowledge-extractor/connector-instagram';
-import { InMemoryStorage } from '@knowledge-extractor/storage';
 import { SessionManager } from './session-manager.js';
 import { Scheduler } from './scheduler.js';
 
@@ -35,12 +41,15 @@ interface ExtractResponse {
  *    while a crawl is active (no perpetual `setInterval`).
  *  - A `chrome.alarms` watchdog wakes the worker after suspension and resumes
  *    the loop from persisted state.
- *  - Scheduler queue and session are persisted to `chrome.storage.session`
- *    after every state transition, so no work is lost or duplicated.
+ *  - Scheduler queue, session, and diagnostics are persisted to
+ *    `chrome.storage.local` (durable across browser restart) after every state
+ *    transition, so no work is lost or duplicated. Normalized resources are
+ *    persisted to the durable `IStorageEngine`.
  */
 export class CrawlController {
   static readonly ALARM_NAME = 'ke-crawl-tick';
   private static readonly SCHED_KEY = 'crawl_scheduler';
+  private static readonly DIAG_KEY = 'crawl_diagnostics';
   private static readonly TICK_MS = 800;
   private static readonly MAX_EMPTY_SCROLLS = 3;
 
@@ -51,7 +60,9 @@ export class CrawlController {
   private readonly metrics: MetricsCollector;
   private readonly diagnostics: DiagnosticsCollector;
   private readonly connector: InstagramConnector;
-  private readonly storage: InMemoryStorage;
+  private readonly storage: IStorageEngine;
+  /** Durable media store. Owned here for later phases; not consumed in Beta-0. */
+  private readonly mediaStore: IMediaStore;
 
   private loopTimer: ReturnType<typeof setTimeout> | null = null;
   private isProcessing = false;
@@ -61,12 +72,14 @@ export class CrawlController {
     metrics: MetricsCollector,
     diagnostics: DiagnosticsCollector,
     connector: InstagramConnector,
-    storage: InMemoryStorage,
+    storage: IStorageEngine,
+    mediaStore: IMediaStore,
   ) {
     this.metrics = metrics;
     this.diagnostics = diagnostics;
     this.connector = connector;
     this.storage = storage;
+    this.mediaStore = mediaStore;
     this.sessionManager = new SessionManager(metrics);
   }
 
@@ -79,6 +92,7 @@ export class CrawlController {
   async init(): Promise<void> {
     await this.sessionManager.init();
     await this.hydrateScheduler();
+    await this.hydrateDiagnostics();
 
     const session = this.sessionManager.getSession();
     if (session?.isRunning && !session.isPaused) {
@@ -97,6 +111,7 @@ export class CrawlController {
 
     const pageUrl = await this.activeTabUrl();
     this.diagnostics.reset(pageUrl);
+    await this.persistDiagnostics();
 
     await this.ensureAlarm();
     this.broadcastEvent('CRAWL_STARTED', { sessionId: session.sessionId });
@@ -140,6 +155,7 @@ export class CrawlController {
     await this.sessionManager.update({ isRunning: false, navigationStatus: `finished:${reason}` });
     this.stopLoop();
     await this.clearAlarm();
+    await this.persistDiagnostics();
     this.broadcastEvent('CRAWL_FINISHED', { sessionId: session?.sessionId ?? '', reason });
     this.logger.info(`Crawl finished: ${reason}`);
   }
@@ -301,6 +317,7 @@ export class CrawlController {
       this.isProcessing = false;
       this.metrics.observeQueueDepth(this.scheduler.getQueueDepth());
       await this.persistScheduler();
+      await this.persistDiagnostics();
       await this.sessionManager.update({ currentResource: '', navigationStatus: 'idle' });
       await this.sessionManager.sync(this.scheduler.getQueueDepth());
     }
@@ -378,17 +395,31 @@ export class CrawlController {
   // ---- Persistence helpers --------------------------------------------------
 
   private async persistScheduler(): Promise<void> {
-    await chrome.storage.session.set({
+    await chrome.storage.local.set({
       [CrawlController.SCHED_KEY]: this.scheduler.snapshot(),
     });
   }
 
   private async hydrateScheduler(): Promise<void> {
-    const data = await chrome.storage.session.get(CrawlController.SCHED_KEY);
+    const data = await chrome.storage.local.get(CrawlController.SCHED_KEY);
     const tasks = data[CrawlController.SCHED_KEY] as ICrawlTask[] | undefined;
     if (tasks && tasks.length > 0) {
       this.scheduler.restore(tasks);
       this.metrics.observeQueueDepth(this.scheduler.getQueueDepth());
+    }
+  }
+
+  private async persistDiagnostics(): Promise<void> {
+    await chrome.storage.local.set({
+      [CrawlController.DIAG_KEY]: this.diagnostics.snapshot(),
+    });
+  }
+
+  private async hydrateDiagnostics(): Promise<void> {
+    const data = await chrome.storage.local.get(CrawlController.DIAG_KEY);
+    const state = data[CrawlController.DIAG_KEY] as IDiagnosticsState | undefined;
+    if (state) {
+      this.diagnostics.hydrate(state);
     }
   }
 
@@ -400,6 +431,14 @@ export class CrawlController {
 
   exportDiagnostics(): ISessionReport {
     return this.diagnostics.buildReport(this.metrics.snapshot());
+  }
+
+  /**
+   * Exposes the durable media store for later phases (e.g. the Beta-1 media
+   * capture / OCR pipeline). Not consumed in Beta-0.
+   */
+  getMediaStore(): IMediaStore {
+    return this.mediaStore;
   }
 
   // ---- Chrome glue ----------------------------------------------------------

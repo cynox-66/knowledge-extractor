@@ -26,9 +26,10 @@ interface ITransaction {
 | `InMemoryStorage`        | `packages/storage/src/memory-storage.ts`              | Volatile (lost on unload)                    | Tests, fallback |
 | `IndexedDbStorageEngine` | `packages/storage/src/indexeddb/indexeddb-storage.ts` | Durable across SW eviction + browser restart | Beta default    |
 
-> Beta-0 Phase 3 swaps the `CrawlController` wiring from `InMemoryStorage` to
-> `IndexedDbStorageEngine`. As of Phase 1 the durable engine exists and is fully
-> tested but is not yet wired into the background worker.
+> As of Beta-0 Phase 3 the background worker wires `IndexedDbStorageEngine` into
+> `CrawlController` (typed as `IStorageEngine`), falling back to `InMemoryStorage`
+> only where IndexedDB is unavailable. The composition root requests
+> `navigator.storage.persist()` at startup.
 
 ## IndexedDB engine (Beta-0)
 
@@ -59,8 +60,10 @@ callers (`CrawlController`) hold a transaction across ticks. `commit()` is atomi
 The `IndexedDbStorageEngine` also exposes typed auxiliary accessors
 (`saveSession`/`getSession`/`saveDiagnostics`/`getDiagnostics`/`saveCrawlState`/…)
 for the non-resource stores. These are additive to the concrete class and do not
-change the frozen `IStorageEngine` interface; they are wired into `SessionManager`
-and `CrawlController` in Phase 3.
+change the frozen `IStorageEngine` interface. **They are not used by the runtime
+control path** — Phase 3 persists live control state to `chrome.storage.local`
+(see below) to avoid coupling control subsystems to the concrete engine. These
+stores remain reserved for future session-history / export features.
 
 ## Media store (Beta-0 Phase 2)
 
@@ -135,16 +138,22 @@ backend (cloud). `IMediaStore` and all consumers are unchanged.
   persistence arrives with LRU cleanup.
 - `OpfsBlobBackend` is exercised via the in-memory backend in unit tests; a real
   browser smoke test is part of Phase 5.
-- `navigator.storage.persist()` is **not** requested yet (Phase 3) — OPFS is
-  durable across restart but evictable under storage pressure until then.
+- `navigator.storage.persist()` is requested at startup (Phase 3); if denied,
+  OPFS + IndexedDB remain durable across restart but evictable under storage
+  pressure. Denial is logged, not fatal.
 
-## Session/queue persistence (Alpha — pre-Phase-3)
+## Control-state persistence (Beta-0 Phase 3)
 
-Until Phase 3 wires the durable engine in, crawl session state and the Scheduler
-queue persist to `chrome.storage.session` (survives SW eviction but **not** a
-browser restart):
+Crawl **control state** is small, frequently written, and persisted to
+`chrome.storage.local` — durable across SW eviction **and** full browser
+restart. (Resources go to IndexedDB; media blobs to OPFS.) Control state uses
+`chrome.storage.local` rather than the IndexedDB auxiliary stores to avoid
+coupling the control subsystems to the concrete engine; the IndexedDB
+`sessions`/`diagnostics`/`crawlState` stores remain reserved for future
+session-history / export features.
 
-| Key               | Contents                                     | Owner             |
-| ----------------- | -------------------------------------------- | ----------------- |
-| `crawl_session`   | `ICrawlSession` (status + metrics snapshot)  | `SessionManager`  |
-| `crawl_scheduler` | `ICrawlTask[]` (full queue with retry state) | `CrawlController` |
+| Key                 | Contents                                        | Owner             |
+| ------------------- | ----------------------------------------------- | ----------------- |
+| `crawl_session`     | `ICrawlSession` (status + metrics snapshot)     | `SessionManager`  |
+| `crawl_scheduler`   | `ICrawlTask[]` (full queue with retry state)    | `CrawlController` |
+| `crawl_diagnostics` | `IDiagnosticsState` (failures + strategy usage) | `CrawlController` |
