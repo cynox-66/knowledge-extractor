@@ -5,10 +5,16 @@
   "main": "src/index.ts",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src"
+    "lint": "eslint src tests",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
-    "@knowledge-extractor/types": "workspace:*",
-    "@knowledge-extractor/shared": "workspace:*"
+    "@knowledge-extractor/shared": "workspace:*",
+    "@knowledge-extractor/types": "workspace:*"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "^6.0.0",
+    "vitest": "^2.1.9"
   }
 }
