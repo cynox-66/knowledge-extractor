@@ -1,4 +1,4 @@
-import { IResource, ResourceState } from '../core/resource';
+import { IResource, ResourceState } from '../core/resource.js';
 
 /**
  * The base interface for all domain events emitted throughout the extraction lifecycle.

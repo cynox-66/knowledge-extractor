@@ -96,6 +96,9 @@ importers:
         specifier: workspace:*
         version: link:../../packages/types
     devDependencies:
+      '@types/jsdom':
+        specifier: ^28.0.3
+        version: 28.0.3
       '@vitest/coverage-v8':
         specifier: ^2.1.9
         version: 2.1.9(vitest@2.1.9(@types/node@26.0.1)(jsdom@29.1.1))
@@ -1345,6 +1348,12 @@ packages:
         integrity: sha512-fluxdy7ryD3MV6h8pTfTYpy/xQzCFC7m89nOH9y94cNqJ1mDIDPut7MnRHI3F6qRmh/cT2fUjG1MLdCNb4hE9A==,
       }
 
+  '@types/jsdom@28.0.3':
+    resolution:
+      {
+        integrity: sha512-/HQ2uFoetFTXuye8vzIcHw2z6Fwi7Hi/qcgC+RoS9NCyewiqxhVGqlG+ViGB6lkax481R6dmhf1I7lIGlzJStQ==,
+      }
+
   '@types/json-schema@7.0.15':
     resolution:
       {
@@ -1387,6 +1396,12 @@ packages:
     resolution:
       {
         integrity: sha512-vfEqpXTvwT91yhmwdfouStN2hSKwTvyRs8qpLfADyrq/kxDw0hZM7Wk9Ug1FELj8hIby+S/+kQCSRFF32nv2Qw==,
+      }
+
+  '@types/tough-cookie@4.0.5':
+    resolution:
+      {
+        integrity: sha512-/Ad8+nIOV7Rl++6f1BdKxFSMgmoqEoYbHRpPcx3JEfv8VRsQe9Z4mCXeJBzxs7mbHY/XOZZuXlRNfhpVPbs6ZA==,
       }
 
   '@typescript-eslint/eslint-plugin@7.18.0':
@@ -4742,6 +4757,12 @@ packages:
       }
     engines: { node: '>= 0.4' }
 
+  undici-types@7.28.0:
+    resolution:
+      {
+        integrity: sha512-LJAfY+2w6HGeT8d8J1wNQsUGUEGio6NWWpwdwurQe4f6oojzCFuGLizl1KSve4irsTxyLly1QhEeE6iapdaIvQ==,
+      }
+
   undici-types@8.3.0:
     resolution:
       {
@@ -5812,6 +5833,13 @@ snapshots:
 
   '@types/har-format@1.2.16': {}
 
+  '@types/jsdom@28.0.3':
+    dependencies:
+      '@types/node': 26.0.1
+      '@types/tough-cookie': 4.0.5
+      parse5: 8.0.1
+      undici-types: 7.28.0
+
   '@types/json-schema@7.0.15': {}
 
   '@types/json5@0.0.29': {}
@@ -5832,6 +5860,8 @@ snapshots:
     dependencies:
       '@types/prop-types': 15.7.15
       csstype: 3.2.3
+
+  '@types/tough-cookie@4.0.5': {}
 
   '@typescript-eslint/eslint-plugin@7.18.0(@typescript-eslint/parser@7.18.0(eslint@9.39.4(jiti@2.6.1))(typescript@5.9.3))(eslint@9.39.4(jiti@2.6.1))(typescript@5.9.3)':
     dependencies:
@@ -7995,6 +8025,8 @@ snapshots:
       has-bigints: 1.1.0
       has-symbols: 1.1.0
       which-boxed-primitive: 1.1.1
+
+  undici-types@7.28.0: {}
 
   undici-types@8.3.0: {}
 

@@ -1,4 +1,4 @@
-import { IResource } from '../core/resource';
+import { IResource } from '../core/resource.js';
 
 /**
  * Represents a transactional unit of work against the storage engine.

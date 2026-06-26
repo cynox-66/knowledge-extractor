@@ -1,4 +1,4 @@
-import { IRawSourceResource } from './pipeline';
+import { IRawSourceResource } from './pipeline.js';
 
 /**
  * The layout classification of an Instagram post as determined by the Parser.

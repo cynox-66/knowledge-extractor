@@ -1,4 +1,4 @@
-import { IExtractionResult } from './extraction';
+import { IExtractionResult } from './extraction.js';
 
 /**
  * Defines the capabilities of a specific connector implementation.

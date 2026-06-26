@@ -1,4 +1,4 @@
-import { IResource } from '../core/resource';
+import { IResource } from '../core/resource.js';
 
 /**
  * Standardizes the output yielded by a connector's extraction pipeline.

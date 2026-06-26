@@ -1,17 +1,17 @@
 import { IResource } from '@knowledge-extractor/types';
 import { Logger } from '@knowledge-extractor/shared';
-import { StrategyChain } from './strategy-chain';
-import { InstagramParser, InstagramNormalizer } from './parser';
+import { StrategyChain } from './strategy-chain.js';
+import { InstagramParser, InstagramNormalizer } from './parser.js';
 import {
   SemanticArticleStrategy,
   DataAttributeStrategy,
   StructuralHeuristicStrategy,
   ArticleElement,
-} from './strategies';
+} from './strategies.js';
 import { IInstagramParsedPost } from '@knowledge-extractor/types';
 
-export { DiscoveryEngine } from './discovery-engine';
-export { ResourceFingerprinter } from './fingerprinter';
+export { DiscoveryEngine } from './discovery-engine.js';
+export { ResourceFingerprinter } from './fingerprinter.js';
 
 /**
  * The Instagram Connector — public entry point.

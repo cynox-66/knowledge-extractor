@@ -2,8 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
 import { JSDOM } from 'jsdom';
-import { InstagramConnector } from '../src/index';
-import { SemanticArticleStrategy } from '../src/strategies';
+import { InstagramConnector } from '../src/index.js';
+import { SemanticArticleStrategy } from '../src/strategies.js';
 import type { IResource } from '@knowledge-extractor/types';
 
 const FIXTURES_DIR = resolve(__dirname, './fixtures');
@@ -63,7 +63,7 @@ describe('Instagram Connector — Fixture Regression Tests', () => {
     assertResource(resource, expected);
     expect(resource.media.length).toBe(3);
     expect(resource.children?.length).toBe(3);
-    resource.children?.forEach((child) => {
+    resource.children?.forEach((child: any) => {
       expect(child.kind).toBe('instagram-slide');
     });
   });
@@ -79,7 +79,7 @@ describe('Instagram Connector — Fixture Regression Tests', () => {
     const resource = await connector.normalize(stratResult.data!);
     assertResource(resource, expected);
     expect(resource.kind).toBe('instagram-reel');
-    const videoMedia = resource.media.find((m) => m.type === 'video');
+    const videoMedia = resource.media.find((m: any) => m.type === 'video');
     expect(videoMedia).toBeDefined();
   });
 

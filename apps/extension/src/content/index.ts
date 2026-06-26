@@ -7,7 +7,7 @@
 import { IDiscoveredResource } from '@knowledge-extractor/types';
 import { Logger, featureFlags, FeatureFlag, MetricsCollector } from '@knowledge-extractor/shared';
 import { DiscoveryEngine } from '@knowledge-extractor/connector-instagram';
-import { Navigator } from './navigator';
+import { Navigator } from './navigator.js';
 
 const logger = new Logger('ContentScript');
 const metrics = new MetricsCollector();

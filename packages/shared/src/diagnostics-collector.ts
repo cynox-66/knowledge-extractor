@@ -4,7 +4,7 @@ import {
   FailureCategory,
   IExtractionMetrics,
 } from '@knowledge-extractor/types';
-import { Logger } from './logger';
+import { Logger } from './logger.js';
 
 /**
  * Accumulates all diagnostic data for a single extraction session.
@@ -42,10 +42,10 @@ export class DiagnosticsCollector {
       targetUri,
       category,
       rootCause,
-      errorDetail: opts?.errorDetail,
-      domSnapshot: opts?.domSnapshot?.slice(0, 2000),
-      failingStrategy: opts?.failingStrategy,
     };
+    if (opts?.errorDetail) record.errorDetail = opts.errorDetail;
+    if (opts?.domSnapshot) record.domSnapshot = opts.domSnapshot.slice(0, 2000);
+    if (opts?.failingStrategy) record.failingStrategy = opts.failingStrategy;
     this.failures.push(record);
     this.logger.warn(`Failure recorded [${category}]: ${rootCause}`, { targetUri });
   }
@@ -62,7 +62,7 @@ export class DiagnosticsCollector {
       memoryUsageMb = Math.round((mem.usedJSHeapSize / 1024 / 1024) * 10) / 10;
     }
 
-    return {
+    const report: ISessionReport = {
       sessionId: this.sessionId,
       startedAt: this.startedAt,
       endedAt: new Date().toISOString(),
@@ -70,8 +70,11 @@ export class DiagnosticsCollector {
       metrics,
       failures: this.failures,
       strategyUsage: this.strategyUsage,
-      memoryUsageMb,
     };
+    if (memoryUsageMb !== undefined) {
+      report.memoryUsageMb = memoryUsageMb;
+    }
+    return report;
   }
 
   getFailures(): IFailureRecord[] {

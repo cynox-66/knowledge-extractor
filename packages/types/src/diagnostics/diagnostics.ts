@@ -1,4 +1,4 @@
-import { IExtractionMetrics } from '@knowledge-extractor/types';
+import { IExtractionMetrics } from '../connector/metrics.js';
 
 /** Classification of a single extraction failure. */
 export type FailureCategory =

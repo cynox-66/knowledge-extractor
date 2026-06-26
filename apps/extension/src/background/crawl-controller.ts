@@ -2,8 +2,8 @@ import { Logger, MetricsCollector, DiagnosticsCollector } from '@knowledge-extra
 import { IDiscoveredResource, ICrawlSession } from '@knowledge-extractor/types';
 import { InstagramConnector } from '@knowledge-extractor/connector-instagram';
 import { InMemoryStorage } from '@knowledge-extractor/storage';
-import { SessionManager } from './session-manager';
-import { Scheduler } from './scheduler';
+import { SessionManager } from './session-manager.js';
+import { Scheduler } from './scheduler.js';
 
 /**
  * Supreme Orchestrator of the Crawl Lifecycle.

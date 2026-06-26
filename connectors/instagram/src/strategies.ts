@@ -68,22 +68,24 @@ export class SemanticArticleStrategy implements IExtractionStrategy<
           ? 'reel'
           : 'single-image';
 
+    const data: IInstagramParsedPost = {
+      providerName: 'instagram',
+      sourceUri,
+      externalId,
+      mediaUris: videoUri ? [videoUri, ...mediaUris] : mediaUris,
+      layout,
+    };
+    if (authorHandle) data.authorHandle = authorHandle;
+    if (authorDisplayName) data.authorDisplayName = authorDisplayName;
+    if (textContent) data.textContent = textContent;
+    if (publishedAt) data.publishedAt = publishedAt;
+    if (slideUris) data.slideUris = slideUris;
+    if (videoUri) data.videoUri = videoUri;
+
     return {
       applicable: true,
       confidence: 0.85,
-      data: {
-        providerName: 'instagram',
-        sourceUri,
-        externalId,
-        authorHandle,
-        authorDisplayName,
-        textContent,
-        publishedAt,
-        mediaUris: videoUri ? [videoUri, ...mediaUris] : mediaUris,
-        slideUris,
-        videoUri,
-        layout,
-      },
+      data,
     };
   }
 
@@ -126,18 +128,19 @@ export class DataAttributeStrategy implements IExtractionStrategy<
       .filter(Boolean);
     const textContent = textNodes.length > 0 ? textNodes.join(' ') : undefined;
 
+    const data: IInstagramParsedPost = {
+      providerName: 'instagram',
+      sourceUri,
+      externalId,
+      mediaUris,
+      layout: 'single-image',
+    };
+    if (textContent) data.textContent = textContent;
+
     return {
       applicable: true,
       confidence: 0.5,
-      data: {
-        providerName: 'instagram',
-        sourceUri,
-        externalId,
-        authorHandle: undefined,
-        textContent,
-        mediaUris,
-        layout: 'single-image',
-      },
+      data,
     };
   }
 }
@@ -167,20 +170,22 @@ export class StructuralHeuristicStrategy implements IExtractionStrategy<
     const sourceUri =
       links.length > 0 ? (links[0] as HTMLAnchorElement).href : window.location.href;
 
+    const data: IInstagramParsedPost = {
+      providerName: 'instagram',
+      sourceUri,
+      externalId: Date.now().toString(),
+      mediaUris: Array.from(imgs)
+        .map((img) => (img as HTMLImageElement).src)
+        .filter(Boolean),
+      layout: 'unknown',
+    };
+    const textContent = article.textContent?.slice(0, 200).trim();
+    if (textContent) data.textContent = textContent;
+
     return {
       applicable: true,
       confidence: 0.2,
-      data: {
-        providerName: 'instagram',
-        sourceUri,
-        externalId: Date.now().toString(),
-        authorHandle: undefined,
-        textContent: article.textContent?.slice(0, 200).trim(),
-        mediaUris: Array.from(imgs)
-          .map((img) => (img as HTMLImageElement).src)
-          .filter(Boolean),
-        layout: 'unknown',
-      },
+      data,
     };
   }
 }

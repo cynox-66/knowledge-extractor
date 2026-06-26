@@ -1,6 +1,6 @@
 import { IDiscoveredResource } from '@knowledge-extractor/types';
 import { Logger } from '@knowledge-extractor/shared';
-import { ResourceFingerprinter } from './fingerprinter';
+import { ResourceFingerprinter } from './fingerprinter.js';
 
 type DiscoveryCallback = (resource: IDiscoveredResource, fingerprint: string) => void;
 
@@ -96,12 +96,13 @@ export class DiscoveryEngine {
     const authorEl = contextEl.querySelector<HTMLAnchorElement>('header a');
     const imgs = contextEl.querySelectorAll('img');
 
-    const fp = this.fingerprinter.fingerprint({
-      sourceUri: cleanUri,
-      authorHandle: authorEl?.textContent?.trim(),
-      mediaCount: imgs.length,
-      captionPreview: contextEl.querySelector('h1, span')?.textContent?.slice(0, 64),
-    });
+    const fpInput: any = { sourceUri: cleanUri, mediaCount: imgs.length };
+    const authorHandle = authorEl?.textContent?.trim();
+    if (authorHandle) fpInput.authorHandle = authorHandle;
+    const captionPreview = contextEl.querySelector('h1, span')?.textContent?.slice(0, 64);
+    if (captionPreview) fpInput.captionPreview = captionPreview;
+
+    const fp = this.fingerprinter.fingerprint(fpInput);
 
     if (this.seen.has(fp.hash)) {
       return;

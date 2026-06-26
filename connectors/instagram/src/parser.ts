@@ -56,10 +56,11 @@ export class InstagramNormalizer {
       sourceUri: uri,
     }));
 
-    return {
+    const result: any = {
       id: `ig_${post.externalId || this.djb2(post.sourceUri)}`,
       kind: post.layout === 'reel' ? 'instagram-reel' : 'instagram-post',
       state: ResourceState.EXTRACTED,
+      completeness: { thumbnail: true, metadata: true, media: true, ocr: false },
       source: {
         providerName: 'instagram',
         externalId: post.externalId ?? 'unknown',
@@ -67,9 +68,6 @@ export class InstagramNormalizer {
         extractedAt: new Date().toISOString(),
         metadata: { layout: post.layout },
       },
-      author: post.authorHandle
-        ? { handle: post.authorHandle, displayName: post.authorDisplayName }
-        : undefined,
       content: post.textContent ? [{ type: BlockType.TEXT, value: post.textContent }] : [],
       media,
       children:
@@ -78,6 +76,7 @@ export class InstagramNormalizer {
               id: `ig_${post.externalId}_slide_${idx}`,
               kind: 'instagram-slide',
               state: ResourceState.EXTRACTED,
+              completeness: { thumbnail: true, metadata: true, media: true, ocr: false },
               source: {
                 providerName: 'instagram',
                 externalId: `${post.externalId}_slide_${idx}`,
@@ -89,6 +88,15 @@ export class InstagramNormalizer {
             }))
           : [],
     };
+
+    if (post.authorHandle) {
+      result.author = {
+        handle: post.authorHandle,
+        ...(post.authorDisplayName ? { displayName: post.authorDisplayName } : {}),
+      };
+    }
+
+    return result;
   }
 
   private djb2(str: string): string {

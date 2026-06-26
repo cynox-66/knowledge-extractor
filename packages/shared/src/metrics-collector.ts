@@ -1,5 +1,5 @@
 import { IExtractionMetrics } from '@knowledge-extractor/types';
-import { Logger } from './logger';
+import { Logger } from './logger.js';
 
 /**
  * Accumulates runtime metrics during an extraction session and emits

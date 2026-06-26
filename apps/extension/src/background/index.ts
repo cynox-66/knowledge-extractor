@@ -3,7 +3,7 @@
  */
 import { Logger, MetricsCollector, DiagnosticsCollector } from '@knowledge-extractor/shared';
 import { IDiscoveredResource } from '@knowledge-extractor/types';
-import { CrawlController } from './crawl-controller';
+import { CrawlController } from './crawl-controller.js';
 import { InstagramConnector } from '@knowledge-extractor/connector-instagram';
 import { InMemoryStorage } from '@knowledge-extractor/storage';
 
