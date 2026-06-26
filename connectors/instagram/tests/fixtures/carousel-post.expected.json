@@ -1,0 +1,93 @@
+{
+  "id": "ig_carousel456",
+  "kind": "instagram-post",
+  "state": "extracted",
+  "source": {
+    "providerName": "instagram",
+    "externalId": "carousel456",
+    "originalUri": "https://www.instagram.com/p/carousel456/"
+  },
+  "author": {
+    "handle": "carousel_user",
+    "displayName": "Carousel User"
+  },
+  "content": [
+    {
+      "type": "text",
+      "value": "A trip through the Swiss Alps! 🏔️ #travel #switzerland"
+    }
+  ],
+  "media": [
+    {
+      "id": "carousel456_media_0",
+      "type": "image",
+      "sourceUri": "https://cdn.example.com/media/slide_1.jpg"
+    },
+    {
+      "id": "carousel456_media_1",
+      "type": "image",
+      "sourceUri": "https://cdn.example.com/media/slide_2.jpg"
+    },
+    {
+      "id": "carousel456_media_2",
+      "type": "image",
+      "sourceUri": "https://cdn.example.com/media/slide_3.jpg"
+    }
+  ],
+  "children": [
+    {
+      "id": "ig_carousel456_slide_0",
+      "kind": "instagram-slide",
+      "state": "extracted",
+      "source": {
+        "providerName": "instagram",
+        "externalId": "carousel456_slide_0",
+        "originalUri": "https://www.instagram.com/p/carousel456/"
+      },
+      "content": [],
+      "media": [
+        {
+          "id": "slide_media_0",
+          "type": "image",
+          "sourceUri": "https://cdn.example.com/media/slide_1.jpg"
+        }
+      ]
+    },
+    {
+      "id": "ig_carousel456_slide_1",
+      "kind": "instagram-slide",
+      "state": "extracted",
+      "source": {
+        "providerName": "instagram",
+        "externalId": "carousel456_slide_1",
+        "originalUri": "https://www.instagram.com/p/carousel456/"
+      },
+      "content": [],
+      "media": [
+        {
+          "id": "slide_media_1",
+          "type": "image",
+          "sourceUri": "https://cdn.example.com/media/slide_2.jpg"
+        }
+      ]
+    },
+    {
+      "id": "ig_carousel456_slide_2",
+      "kind": "instagram-slide",
+      "state": "extracted",
+      "source": {
+        "providerName": "instagram",
+        "externalId": "carousel456_slide_2",
+        "originalUri": "https://www.instagram.com/p/carousel456/"
+      },
+      "content": [],
+      "media": [
+        {
+          "id": "slide_media_2",
+          "type": "image",
+          "sourceUri": "https://cdn.example.com/media/slide_3.jpg"
+        }
+      ]
+    }
+  ]
+}

@@ -1,7 +1,7 @@
-import { ISource } from './source';
-import { IAuthor } from './author';
-import { IMedia } from './media';
-import { IContentBlock } from './content';
+import { ISource } from './source.js';
+import { IAuthor } from './author.js';
+import { IMedia } from './media.js';
+import { IContentBlock } from './content.js';
 
 /**
  * Defines the fundamental lifecycle states of a Resource.
@@ -13,6 +13,16 @@ export enum ResourceState {
   ENRICHED = 'enriched',
   PERSISTED = 'persisted',
   EXPORTED = 'exported',
+}
+
+/**
+ * Tracks which parts of a resource have been successfully extracted.
+ */
+export interface IResourceCompleteness {
+  thumbnail: boolean;
+  metadata: boolean;
+  media: boolean;
+  ocr: boolean;
 }
 
 /**
@@ -55,4 +65,8 @@ export interface IResource {
    * (e.g., a Thread containing multiple nested reply Resources).
    */
   children?: IResource[];
+  /**
+   * Indicates the extraction completeness of this resource.
+   */
+  completeness: IResourceCompleteness;
 }

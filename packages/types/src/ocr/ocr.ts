@@ -1,5 +1,5 @@
-import { IMedia } from '../core/media';
-import { IContentBlock } from '../core/content';
+import { IMedia } from '../core/media.js';
+import { IContentBlock } from '../core/content.js';
 
 /**
  * The standard interface for Optical Character Recognition engines.

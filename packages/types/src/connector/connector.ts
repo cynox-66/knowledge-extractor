@@ -1,42 +1,31 @@
-import { IExtractionResult } from './extraction';
+import { IResource } from '../core/resource.js';
+import { IRawSourceResource } from './pipeline.js';
 
 /**
- * Defines the capabilities of a specific connector implementation.
+ * The single canonical contract every provider-specific connector must implement.
+ *
+ * A connector is responsible for: recognizing its own URIs (`canHandle`) and
+ * mapping a raw, provider-shaped extraction (`TRaw`) into the strict, normalized
+ * domain model (`normalize`). Discovery and extraction of the raw shape are
+ * connector-internal concerns and are not part of this engine-facing contract.
+ *
+ * `TRaw` is parameterized so a connector can accept its own richer raw type
+ * (which must extend `IRawSourceResource`) without leaking that type into the
+ * platform-agnostic engine layer.
  */
-export interface ConnectorConfig {
+export interface IConnector<TRaw extends IRawSourceResource = IRawSourceResource> {
   /**
    * The unique identifier for this connector (e.g., 'instagram', 'pdf').
    */
-  id: string;
-  /**
-   * Does this connector require an active user session/authentication?
-   */
-  requiresAuth: boolean;
-  /**
-   * Can this connector extract data sequentially using cursors?
-   */
-  supportsPagination: boolean;
-}
-
-/**
- * The standard interface every provider-specific connector must implement.
- */
-export interface IConnector {
-  /**
-   * The static configuration and capabilities of this connector.
-   */
-  readonly config: ConnectorConfig;
+  readonly providerName: string;
 
   /**
-   * Initiates the extraction process for a given external target.
-   * @param targetUri The URL or specific target identifier to extract.
-   * @returns An asynchronous stream of extracted resources.
-   */
-  extract(targetUri: string): AsyncGenerator<IExtractionResult, void, unknown>;
-
-  /**
-   * Validates if this connector is capable of handling the given URI.
-   * @param uri The target URI.
+   * Validates whether this connector is capable of handling the given URI.
    */
   canHandle(uri: string): boolean;
+
+  /**
+   * Maps a raw extracted resource into the strict, normalized domain model.
+   */
+  normalize(raw: TRaw): Promise<IResource>;
 }

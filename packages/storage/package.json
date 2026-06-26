@@ -1,0 +1,14 @@
+{
+  "name": "@knowledge-extractor/storage",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "@knowledge-extractor/types": "workspace:*",
+    "@knowledge-extractor/shared": "workspace:*"
+  }
+}

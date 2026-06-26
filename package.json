@@ -1,0 +1,36 @@
+{
+  "name": "knowledge-extractor-monorepo",
+  "private": true,
+  "description": "Knowledge Extractor: A modular knowledge ingestion platform",
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "lint:root": "eslint .",
+    "format": "prettier --write \"**/*.{ts,tsx,md,json,yaml}\"",
+    "format:check": "prettier --check \"**/*.{ts,tsx,md,json,yaml}\"",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "depcruise": "depcruise packages connectors apps",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.27.1",
+    "@commitlint/cli": "^19.3.0",
+    "@commitlint/config-conventional": "^19.2.2",
+    "@eslint/js": "^9.5.0",
+    "dependency-cruiser": "^16.3.9",
+    "eslint": "^9.5.0",
+    "eslint-plugin-import": "^2.29.1",
+    "husky": "^9.0.11",
+    "lint-staged": "^15.2.7",
+    "prettier": "^3.3.2",
+    "turbo": "^2.0.4",
+    "typescript": "^5.4.5",
+    "typescript-eslint": "^7.13.0"
+  },
+  "packageManager": "pnpm@9.4.0",
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

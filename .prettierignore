@@ -1,0 +1,7 @@
+node_modules/
+dist/
+lib/
+.turbo/
+coverage/
+.claude/
+pnpm-lock.yaml

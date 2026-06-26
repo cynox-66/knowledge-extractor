@@ -1,0 +1,10 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/types" },
+    { "path": "./packages/shared" },
+    { "path": "./packages/storage" },
+    { "path": "./connectors/instagram" },
+    { "path": "./apps/extension" }
+  ]
+}

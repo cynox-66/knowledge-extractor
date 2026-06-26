@@ -1,4 +1,4 @@
-import { IResource } from '../core/resource';
+import { IResource } from '../core/resource.js';
 
 /**
  * Supported export formats.

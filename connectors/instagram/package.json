@@ -1,0 +1,22 @@
+{
+  "name": "@knowledge-extractor/connector-instagram",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src tests"
+  },
+  "dependencies": {
+    "@knowledge-extractor/shared": "workspace:*",
+    "@knowledge-extractor/types": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/jsdom": "^28.0.3",
+    "@vitest/coverage-v8": "^2.1.9",
+    "jsdom": "^29.1.1",
+    "vitest": "^2.1.9"
+  }
+}

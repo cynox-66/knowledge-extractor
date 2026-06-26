@@ -1,0 +1,28 @@
+{
+  "id": "ig_abc123",
+  "kind": "instagram-post",
+  "state": "extracted",
+  "source": {
+    "providerName": "instagram",
+    "externalId": "abc123",
+    "originalUri": "https://www.instagram.com/p/abc123/"
+  },
+  "author": {
+    "handle": "testuser",
+    "displayName": "Test User"
+  },
+  "content": [
+    {
+      "type": "text",
+      "value": "A beautiful sunset over the mountains. #nature #photography"
+    }
+  ],
+  "media": [
+    {
+      "id": "abc123_media_0",
+      "type": "image",
+      "sourceUri": "https://cdn.example.com/media/post_abc123.jpg"
+    }
+  ],
+  "children": []
+}
