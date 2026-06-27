@@ -11,7 +11,12 @@
  * Asynchronous startup (persistence request + recovery) runs afterwards.
  */
 import { Logger, MetricsCollector, DiagnosticsCollector } from '@knowledge-extractor/shared';
-import { IDiscoveredResource, IStorageEngine, IMediaStore } from '@knowledge-extractor/types';
+import {
+  IDiscoveredResource,
+  IStorageEngine,
+  IControlStateStore,
+  IMediaStore,
+} from '@knowledge-extractor/types';
 import { CrawlController } from './crawl-controller.js';
 import { InstagramConnector } from '@knowledge-extractor/connector-instagram';
 import {
@@ -27,14 +32,56 @@ const metrics = new MetricsCollector();
 const diagnostics = new DiagnosticsCollector();
 const connector = new InstagramConnector();
 
-// Durable resource storage. IndexedDB is the default; in the rare environment
-// where it is unavailable, degrade to volatile in-memory storage (with a clear
-// warning) so the crawler still functions — persistence failures then surface
-// as recorded task failures rather than silent data loss.
-const storage: IStorageEngine =
-  typeof indexedDB !== 'undefined' ? new IndexedDbStorageEngine() : new InMemoryStorage();
-if (typeof indexedDB === 'undefined') {
-  logger.warn('IndexedDB unavailable — using volatile in-memory storage');
+/**
+ * Volatile fallback for `IControlStateStore` when IndexedDB is unavailable.
+ * Kept local to the composition root because it is only ever instantiated by
+ * the bootstrap — no new exported abstraction.
+ */
+class InMemoryControlStateStore implements IControlStateStore {
+  private readonly sessions = new Map<string, unknown>();
+  private readonly diagnostics = new Map<string, unknown>();
+  private readonly crawlState = new Map<string, unknown>();
+  saveSession(s: { sessionId: string }): Promise<void> {
+    this.sessions.set(s.sessionId, s);
+    return Promise.resolve();
+  }
+  getSession(id: string): Promise<never> {
+    return Promise.resolve(this.sessions.get(id) as never);
+  }
+  listSessions(): Promise<never> {
+    return Promise.resolve([...this.sessions.values()] as never);
+  }
+  saveDiagnostics(r: { sessionId: string }): Promise<void> {
+    this.diagnostics.set(r.sessionId, r);
+    return Promise.resolve();
+  }
+  getDiagnostics(id: string): Promise<never> {
+    return Promise.resolve(this.diagnostics.get(id) as never);
+  }
+  saveCrawlState(key: string, value: unknown): Promise<void> {
+    this.crawlState.set(key, value);
+    return Promise.resolve();
+  }
+  getCrawlState<T = unknown>(key: string): Promise<T | null> {
+    return Promise.resolve((this.crawlState.get(key) as T) ?? null);
+  }
+  deleteCrawlState(key: string): Promise<void> {
+    this.crawlState.delete(key);
+    return Promise.resolve();
+  }
+}
+
+// Durable resource + control-state storage. IndexedDB is the default; in the
+// rare environment where it is unavailable, degrade to volatile in-memory
+// resource storage (with a clear warning). Control state cannot be made
+// durable without IndexedDB, so the same fallback applies — the unified
+// `IndexedDbStorageEngine` implements both `IStorageEngine` and
+// `IControlStateStore`, so a single instance serves both contracts.
+const idbEngine = typeof indexedDB !== 'undefined' ? new IndexedDbStorageEngine() : null;
+const storage: IStorageEngine = idbEngine ?? new InMemoryStorage();
+const controlStore: IControlStateStore = idbEngine ?? new InMemoryControlStateStore();
+if (!idbEngine) {
+  logger.warn('IndexedDB unavailable — using volatile in-memory storage + control state');
 }
 
 // Durable media store (bytes in OPFS). Falls back to a volatile in-memory blob
@@ -46,7 +93,14 @@ if (!OpfsBlobBackend.isSupported()) {
   logger.warn('OPFS unavailable — media store using volatile in-memory backend');
 }
 
-const controller = new CrawlController(metrics, diagnostics, connector, storage, mediaStore);
+const controller = new CrawlController(
+  metrics,
+  diagnostics,
+  connector,
+  storage,
+  controlStore,
+  mediaStore,
+);
 
 /** Requests durable (non-evictable) storage. Best-effort; safe if unsupported. */
 async function requestPersistence(): Promise<void> {
@@ -62,9 +116,41 @@ async function requestPersistence(): Promise<void> {
   }
 }
 
-/** Async startup: request persistence, probe storage, then recover state. */
+/**
+ * One-shot migration: lift control state out of `chrome.storage.local` and into
+ * the durable `IControlStateStore` (IndexedDB). Beta-0 Phase 3 wrote three keys
+ * (`crawl_session`, `crawl_scheduler`, `crawl_diagnostics`) to
+ * `chrome.storage.local`; Phase 3.5 reads them once, writes them to IndexedDB,
+ * then clears them. Idempotent — a second run is a no-op.
+ */
+async function migrateLegacyControlState(): Promise<void> {
+  // Skip when chrome.storage isn't available (e.g. tests) or when IDB itself
+  // is the fallback (nowhere to migrate to durably).
+  if (typeof chrome === 'undefined' || !chrome.storage?.local || !idbEngine) return;
+
+  const LEGACY = ['crawl_session', 'crawl_scheduler', 'crawl_diagnostics'] as const;
+  try {
+    const found = await chrome.storage.local.get(LEGACY as unknown as string[]);
+    const session = found['crawl_session'];
+    const scheduler = found['crawl_scheduler'];
+    const diag = found['crawl_diagnostics'];
+    if (!session && !scheduler && !diag) return; // already migrated or fresh install
+
+    if (session) await controlStore.saveCrawlState('current_session', session);
+    if (scheduler) await controlStore.saveCrawlState('crawl_scheduler', scheduler);
+    if (diag) await controlStore.saveCrawlState('crawl_diagnostics', diag);
+
+    await chrome.storage.local.remove(LEGACY as unknown as string[]);
+    logger.info('Migrated legacy control state from chrome.storage.local → IndexedDB');
+  } catch (err) {
+    logger.warn('Legacy control-state migration failed (continuing)', err);
+  }
+}
+
+/** Async startup: request persistence, migrate legacy state, probe, recover. */
 async function startup(): Promise<void> {
   await requestPersistence();
+  await migrateLegacyControlState();
   // Probe durable storage so a hard failure (quota/corruption) is visible in
   // diagnostics instead of silently failing every later persistence.
   try {

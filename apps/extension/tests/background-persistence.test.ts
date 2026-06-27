@@ -1,56 +1,85 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { MetricsCollector, DiagnosticsCollector } from '@knowledge-extractor/shared';
-import { TaskState } from '@knowledge-extractor/types';
+import {
+  TaskState,
+  IControlStateStore,
+  ICrawlSession,
+  ISessionReport,
+} from '@knowledge-extractor/types';
 import { SessionManager } from '../src/background/session-manager.js';
 import { Scheduler } from '../src/background/scheduler.js';
 
 /**
- * Minimal `chrome.storage` mock. The backing Maps persist for the lifetime of
- * the installed mock, so creating a fresh `SessionManager` against the same mock
- * simulates a browser restart (chrome.storage.local survives restart).
+ * Minimal `IControlStateStore` for tests. The same instance reused across
+ * SessionManager constructions simulates a browser restart (the durable store
+ * survives; the in-memory caches don't).
  */
-function installChromeMock(): { local: Map<string, unknown>; session: Map<string, unknown> } {
-  const local = new Map<string, unknown>();
-  const session = new Map<string, unknown>();
-  const area = (m: Map<string, unknown>) => ({
-    get: (key: string) => Promise.resolve(m.has(key) ? { [key]: m.get(key) } : {}),
-    set: (obj: Record<string, unknown>) => {
-      for (const [k, v] of Object.entries(obj)) m.set(k, structuredClone(v));
-      return Promise.resolve();
-    },
-  });
-  const mock = {
-    storage: { local: area(local), session: area(session) },
-    runtime: { sendMessage: () => Promise.resolve() },
-  };
-  (globalThis as unknown as { chrome: unknown }).chrome = mock;
-  return { local, session };
+class TestControlStateStore implements IControlStateStore {
+  private readonly sessions = new Map<string, ICrawlSession>();
+  private readonly diagnostics = new Map<string, ISessionReport>();
+  readonly crawlState = new Map<string, unknown>();
+
+  saveSession(s: ICrawlSession): Promise<void> {
+    this.sessions.set(s.sessionId, structuredClone(s));
+    return Promise.resolve();
+  }
+  getSession(id: string): Promise<ICrawlSession | null> {
+    return Promise.resolve(this.sessions.get(id) ?? null);
+  }
+  listSessions(): Promise<ICrawlSession[]> {
+    return Promise.resolve([...this.sessions.values()]);
+  }
+  saveDiagnostics(r: ISessionReport): Promise<void> {
+    this.diagnostics.set(r.sessionId, structuredClone(r));
+    return Promise.resolve();
+  }
+  getDiagnostics(id: string): Promise<ISessionReport | null> {
+    return Promise.resolve(this.diagnostics.get(id) ?? null);
+  }
+  saveCrawlState(key: string, value: unknown): Promise<void> {
+    this.crawlState.set(key, structuredClone(value));
+    return Promise.resolve();
+  }
+  getCrawlState<T = unknown>(key: string): Promise<T | null> {
+    return Promise.resolve((this.crawlState.get(key) as T) ?? null);
+  }
+  deleteCrawlState(key: string): Promise<void> {
+    this.crawlState.delete(key);
+    return Promise.resolve();
+  }
 }
 
-let areas: { local: Map<string, unknown>; session: Map<string, unknown> };
+// `chrome.runtime.sendMessage` is the only chrome API SessionManager.persist()
+// still touches (popup broadcast). Stub it once for the suite.
 beforeEach(() => {
-  areas = installChromeMock();
+  (globalThis as unknown as { chrome: unknown }).chrome = {
+    runtime: { sendMessage: () => Promise.resolve() },
+  };
 });
 
-describe('SessionManager — durable persistence', () => {
-  it('persists the session to chrome.storage.local (not session)', async () => {
-    const sm = new SessionManager(new MetricsCollector());
+describe('SessionManager — durable persistence (IControlStateStore)', () => {
+  it('persists via IControlStateStore, not chrome.storage', async () => {
+    const store = new TestControlStateStore();
+    const sm = new SessionManager(new MetricsCollector(), store);
     await sm.init();
     sm.startNewSession();
     await sm.update({ currentResource: 'x' });
 
-    expect(areas.local.has('crawl_session')).toBe(true);
-    expect(areas.session.size).toBe(0); // nothing written to the volatile area
+    expect(store.crawlState.has('current_session')).toBe(true);
+    // History copies keyed by sessionId are also persisted (one per session
+    // ever observed: the empty init session + the started session).
+    expect((await store.listSessions()).length).toBeGreaterThanOrEqual(1);
   });
 
-  it('restores the session on a fresh instance (browser restart)', async () => {
-    const first = new SessionManager(new MetricsCollector());
+  it('restores the active session on a fresh instance (browser restart)', async () => {
+    const store = new TestControlStateStore();
+    const first = new SessionManager(new MetricsCollector(), store);
     await first.init();
     const created = first.startNewSession();
     await first.update({ navigationStatus: 'extracting', queueDepth: 5 });
 
-    // Fresh manager over the same persistent storage = restart.
-    const second = new SessionManager(new MetricsCollector());
+    // Fresh manager over the same persistent store = restart.
+    const second = new SessionManager(new MetricsCollector(), store);
     await second.init();
     const restored = second.getSession();
 
@@ -60,8 +89,9 @@ describe('SessionManager — durable persistence', () => {
   });
 
   it('rehydrates the canonical metrics from the persisted session', async () => {
+    const store = new TestControlStateStore();
     const metrics = new MetricsCollector();
-    const first = new SessionManager(metrics);
+    const first = new SessionManager(metrics, store);
     await first.init();
     first.startNewSession();
     metrics.recordDiscovered();
@@ -70,7 +100,7 @@ describe('SessionManager — durable persistence', () => {
     await first.sync(0); // persist embeds metrics.snapshot()
 
     const restoredMetrics = new MetricsCollector();
-    const second = new SessionManager(restoredMetrics);
+    const second = new SessionManager(restoredMetrics, store);
     await second.init();
 
     const snap = restoredMetrics.snapshot();
@@ -145,5 +175,24 @@ describe('Scheduler — restore (queue recovery)', () => {
     expect(all).toHaveLength(2); // no duplicate scheduler entries
     // The previously in-flight task is reclaimable (reset to QUEUED).
     expect(restored.getPendingCount()).toBe(2);
+  });
+});
+
+describe('Control-state substrate — single source of truth', () => {
+  it('SessionManager and CrawlController persistence share one store', async () => {
+    // The whole point of Phase 3.5: session + scheduler + diagnostics all sit on
+    // the same IControlStateStore. Demonstrated end-to-end here.
+    const store = new TestControlStateStore();
+    const sm = new SessionManager(new MetricsCollector(), store);
+    await sm.init();
+    sm.startNewSession();
+
+    // Simulate what CrawlController.persistScheduler / persistDiagnostics do.
+    await store.saveCrawlState('crawl_scheduler', [{ id: 't1' }]);
+    await store.saveCrawlState('crawl_diagnostics', { sessionId: 'x', failures: [] });
+
+    expect(await store.getCrawlState('current_session')).not.toBeNull();
+    expect(await store.getCrawlState('crawl_scheduler')).toEqual([{ id: 't1' }]);
+    expect(await store.getCrawlState('crawl_diagnostics')).not.toBeNull();
   });
 });

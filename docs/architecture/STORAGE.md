@@ -57,13 +57,12 @@ required because native IndexedDB transactions auto-close across `await`s, while
 callers (`CrawlController`) hold a transaction across ticks. `commit()` is atomic
 (the native transaction aborts on any error); `rollback()` discards the buffer.
 
-The `IndexedDbStorageEngine` also exposes typed auxiliary accessors
-(`saveSession`/`getSession`/`saveDiagnostics`/`getDiagnostics`/`saveCrawlState`/…)
-for the non-resource stores. These are additive to the concrete class and do not
-change the frozen `IStorageEngine` interface. **They are not used by the runtime
-control path** — Phase 3 persists live control state to `chrome.storage.local`
-(see below) to avoid coupling control subsystems to the concrete engine. These
-stores remain reserved for future session-history / export features.
+The `IndexedDbStorageEngine` also implements the **`IControlStateStore`**
+contract (`packages/types/src/storage/control-state.ts`), exposing
+`saveSession`/`getSession`/`listSessions`/`saveDiagnostics`/`getDiagnostics`/
+`saveCrawlState`/`getCrawlState`/`deleteCrawlState`. One class, two interfaces,
+one backing database — so a single readwrite IndexedDB transaction can span
+resource + control-state writes when atomicity matters.
 
 ## Media store (Beta-0 Phase 2)
 
@@ -142,18 +141,23 @@ backend (cloud). `IMediaStore` and all consumers are unchanged.
   OPFS + IndexedDB remain durable across restart but evictable under storage
   pressure. Denial is logged, not fatal.
 
-## Control-state persistence (Beta-0 Phase 3)
+## Control-state persistence (Beta-0 Phase 3.5)
 
-Crawl **control state** is small, frequently written, and persisted to
-`chrome.storage.local` — durable across SW eviction **and** full browser
-restart. (Resources go to IndexedDB; media blobs to OPFS.) Control state uses
-`chrome.storage.local` rather than the IndexedDB auxiliary stores to avoid
-coupling the control subsystems to the concrete engine; the IndexedDB
-`sessions`/`diagnostics`/`crawlState` stores remain reserved for future
-session-history / export features.
+Crawl **control state** lives in IndexedDB via the `IControlStateStore`
+contract — the same database as resources, governed by the same migrations and
+quota, eligible for the same multi-store transactions. Resources go to
+IndexedDB; control state goes to IndexedDB; media blobs go to OPFS. One
+durable-state substrate (IndexedDB + OPFS), not two.
 
-| Key                 | Contents                                        | Owner             |
-| ------------------- | ----------------------------------------------- | ----------------- |
-| `crawl_session`     | `ICrawlSession` (status + metrics snapshot)     | `SessionManager`  |
-| `crawl_scheduler`   | `ICrawlTask[]` (full queue with retry state)    | `CrawlController` |
-| `crawl_diagnostics` | `IDiagnosticsState` (failures + strategy usage) | `CrawlController` |
+`chrome.storage.local` is no longer used for crawl state. Phase 3 wrote three
+legacy keys there; the composition root runs a one-shot migration at startup to
+lift any existing values into IndexedDB and clear them. After Beta-0,
+`chrome.storage.local` is reserved for future user preferences and feature
+flags (configuration, not runtime state).
+
+| IndexedDB store / crawlState key | Contents                                        | Owner             |
+| -------------------------------- | ----------------------------------------------- | ----------------- |
+| `sessions` + `current_session`   | `ICrawlSession` (status + metrics snapshot)     | `SessionManager`  |
+| `crawl_scheduler`                | `ICrawlTask[]` (full queue with retry state)    | `CrawlController` |
+| `crawl_diagnostics`              | `IDiagnosticsState` (failures + strategy usage) | `CrawlController` |
+| `diagnostics`                    | `ISessionReport` per completed session          | reserved          |

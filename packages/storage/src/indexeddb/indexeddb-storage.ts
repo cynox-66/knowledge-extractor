@@ -1,5 +1,6 @@
 import {
   IStorageEngine,
+  IControlStateStore,
   ITransaction,
   IResource,
   ICrawlSession,
@@ -11,18 +12,18 @@ import { STORES } from './schema.js';
 import { BufferedTransaction } from './transaction.js';
 
 /**
- * Durable, IndexedDB-backed implementation of {@link IStorageEngine}.
+ * Durable, IndexedDB-backed implementation of {@link IStorageEngine} and
+ * {@link IControlStateStore}.
  *
- * Resources are the primary domain entity (the frozen `IStorageEngine`
- * contract). The same database also persists sessions, diagnostics, and generic
- * crawl state via typed auxiliary methods, so all crawl data survives both
- * service-worker eviction and full browser restart. These auxiliary methods are
- * additive to the concrete class; they do not change the `IStorageEngine`
- * interface and are wired into the subsystems in Beta-0 Phase 3.
+ * Two distinct contracts, one backing database. Resources are the frozen
+ * `IStorageEngine` contract; sessions / diagnostics / generic crawl state are
+ * the `IControlStateStore` contract (Beta-0 Phase 3.5 — unified persistence).
+ * Implementing both on one class lets a single readwrite IndexedDB transaction
+ * span resource + control-state writes when atomicity matters.
  *
  * The connection is opened lazily and memoized.
  */
-export class IndexedDbStorageEngine implements IStorageEngine {
+export class IndexedDbStorageEngine implements IStorageEngine, IControlStateStore {
   private readonly logger = new Logger('IndexedDbStorage');
   private dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -91,7 +92,7 @@ export class IndexedDbStorageEngine implements IStorageEngine {
     return listRecords<IResource>(db, STORES.RESOURCES);
   }
 
-  // ---- Auxiliary stores (wired into subsystems in Phase 3) -----------------
+  // ---- IControlStateStore (sessions, diagnostics, crawl state) -------------
 
   async saveSession(session: ICrawlSession): Promise<void> {
     const db = await this.db();

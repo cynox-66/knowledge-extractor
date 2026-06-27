@@ -11,6 +11,7 @@ import {
   FailureCategory,
   ICrawlTask,
   IStorageEngine,
+  IControlStateStore,
   IMediaStore,
 } from '@knowledge-extractor/types';
 import { InstagramConnector } from '@knowledge-extractor/connector-instagram';
@@ -41,10 +42,11 @@ interface ExtractResponse {
  *    while a crawl is active (no perpetual `setInterval`).
  *  - A `chrome.alarms` watchdog wakes the worker after suspension and resumes
  *    the loop from persisted state.
- *  - Scheduler queue, session, and diagnostics are persisted to
- *    `chrome.storage.local` (durable across browser restart) after every state
- *    transition, so no work is lost or duplicated. Normalized resources are
- *    persisted to the durable `IStorageEngine`.
+ *  - Scheduler queue, session, and diagnostics are persisted to the durable
+ *    `IControlStateStore` (IndexedDB) after every state transition, so no work
+ *    is lost or duplicated. Normalized resources are persisted to the durable
+ *    `IStorageEngine`. Sharing a substrate enables cross-store atomicity in a
+ *    single transaction.
  */
 export class CrawlController {
   static readonly ALARM_NAME = 'ke-crawl-tick';
@@ -61,6 +63,7 @@ export class CrawlController {
   private readonly diagnostics: DiagnosticsCollector;
   private readonly connector: InstagramConnector;
   private readonly storage: IStorageEngine;
+  private readonly controlStore: IControlStateStore;
   /** Durable media store. Owned here for later phases; not consumed in Beta-0. */
   private readonly mediaStore: IMediaStore;
 
@@ -73,14 +76,16 @@ export class CrawlController {
     diagnostics: DiagnosticsCollector,
     connector: InstagramConnector,
     storage: IStorageEngine,
+    controlStore: IControlStateStore,
     mediaStore: IMediaStore,
   ) {
     this.metrics = metrics;
     this.diagnostics = diagnostics;
     this.connector = connector;
     this.storage = storage;
+    this.controlStore = controlStore;
     this.mediaStore = mediaStore;
-    this.sessionManager = new SessionManager(metrics);
+    this.sessionManager = new SessionManager(metrics, controlStore);
   }
 
   // ---- Lifecycle ------------------------------------------------------------
@@ -395,14 +400,11 @@ export class CrawlController {
   // ---- Persistence helpers --------------------------------------------------
 
   private async persistScheduler(): Promise<void> {
-    await chrome.storage.local.set({
-      [CrawlController.SCHED_KEY]: this.scheduler.snapshot(),
-    });
+    await this.controlStore.saveCrawlState(CrawlController.SCHED_KEY, this.scheduler.snapshot());
   }
 
   private async hydrateScheduler(): Promise<void> {
-    const data = await chrome.storage.local.get(CrawlController.SCHED_KEY);
-    const tasks = data[CrawlController.SCHED_KEY] as ICrawlTask[] | undefined;
+    const tasks = await this.controlStore.getCrawlState<ICrawlTask[]>(CrawlController.SCHED_KEY);
     if (tasks && tasks.length > 0) {
       this.scheduler.restore(tasks);
       this.metrics.observeQueueDepth(this.scheduler.getQueueDepth());
@@ -410,14 +412,13 @@ export class CrawlController {
   }
 
   private async persistDiagnostics(): Promise<void> {
-    await chrome.storage.local.set({
-      [CrawlController.DIAG_KEY]: this.diagnostics.snapshot(),
-    });
+    await this.controlStore.saveCrawlState(CrawlController.DIAG_KEY, this.diagnostics.snapshot());
   }
 
   private async hydrateDiagnostics(): Promise<void> {
-    const data = await chrome.storage.local.get(CrawlController.DIAG_KEY);
-    const state = data[CrawlController.DIAG_KEY] as IDiagnosticsState | undefined;
+    const state = await this.controlStore.getCrawlState<IDiagnosticsState>(
+      CrawlController.DIAG_KEY,
+    );
     if (state) {
       this.diagnostics.hydrate(state);
     }

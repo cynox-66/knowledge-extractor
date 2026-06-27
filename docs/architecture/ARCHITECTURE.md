@@ -61,8 +61,8 @@ period). Resumes from persisted state on worker restart.
 Owns the `Map<string, ICrawlTask>` queue. Handles enqueue (with dedup),
 priority, task state transitions, and exponential-backoff retry
 (`baseBackoffMs * 2^(attempts-1)`, via `nextRetryAt`). `snapshot()` / `restore()`
-persist the full queue to `chrome.storage.local` (durable across browser
-restart); on restore, in-flight tasks reset to `QUEUED`.
+persist the full queue to IndexedDB via `IControlStateStore` (durable across
+browser restart); on restore, in-flight tasks reset to `QUEUED`.
 
 ### Navigator (`apps/extension/src/content/navigator.ts`)
 
@@ -93,9 +93,9 @@ first applicable result tagged with `{ data, strategyName }`. Current chain:
 
 ### SessionManager (`apps/extension/src/background/session-manager.ts`)
 
-Single source of truth for crawl state. Persists `ICrawlSession` to
-`chrome.storage.local` (durable across browser restart). Embeds a
-`MetricsCollector` snapshot on every persist so counters are never duplicated.
+Single source of truth for crawl state. Persists `ICrawlSession` via
+`IControlStateStore` (IndexedDB-backed, durable across browser restart). Embeds
+a `MetricsCollector` snapshot on every persist so counters are never duplicated.
 Rehydrates metrics on worker restart.
 
 ### MetricsCollector (`packages/shared/src/metrics-collector.ts`)
@@ -109,8 +109,8 @@ Supports `hydrate()` for restoring state after restart.
 Records per-failure data (category, target URI, message, DOM snapshot, failing
 strategy) and per-extraction strategy usage. Produces `ISessionReport` via
 `buildReport(metrics)`. `snapshot()`/`hydrate()` let the background worker
-persist diagnostics to `chrome.storage.local` (durable across restart) without
-coupling `shared` to chrome APIs.
+persist diagnostics through `IControlStateStore` (IndexedDB) without coupling
+`shared` to a specific storage substrate.
 
 ### Storage (`packages/storage`)
 
@@ -138,11 +138,11 @@ stops the crawl.
 
 `apps/extension/src/background/index.ts` is the **only** place that constructs
 infrastructure. It builds `MetricsCollector`, `DiagnosticsCollector`,
-`InstagramConnector`, the `IStorageEngine` (`IndexedDbStorageEngine`, or
-`InMemoryStorage` if IndexedDB is unavailable), and the `IMediaStore`
-(`OpfsBlobBackend`, or `InMemoryBlobBackend` if OPFS is unavailable), then
-injects them into `CrawlController`. Subsystems never construct infrastructure
-themselves.
+`InstagramConnector`, the `IStorageEngine` and `IControlStateStore` (one
+`IndexedDbStorageEngine` instance implementing both, with volatile fallbacks if
+IndexedDB is unavailable), and the `IMediaStore` (`OpfsBlobBackend`, or
+`InMemoryBlobBackend` if OPFS is unavailable), then injects them into
+`CrawlController`. Subsystems never construct infrastructure themselves.
 
 ### Startup lifecycle
 
@@ -152,9 +152,10 @@ SW starts → index.ts (sync):
   2. construct CrawlController(metrics, diagnostics, connector, storage, mediaStore)
   3. register chrome.alarms + chrome.runtime listeners  ← synchronous, before any await
   4. kick off async startup():
-       requestPersistence()           navigator.storage.persist() (best-effort)
-       probe storage                  surface a diagnostic if durable storage is broken
-       controller.init()              recover session + queue + diagnostics, resume if active
+       requestPersistence()             navigator.storage.persist() (best-effort)
+       migrateLegacyControlState()      one-shot lift of Phase-3 keys → IndexedDB
+       probe storage                    surface a diagnostic if durable storage is broken
+       controller.init()                recover session + queue + diagnostics, resume if active
 ```
 
 Listeners are registered synchronously (before the first `await`) so a revived
@@ -162,19 +163,20 @@ worker never misses an event.
 
 ### Persistence lifecycle
 
-| Data                       | Store                        | Survives SW eviction | Survives browser restart |
-| -------------------------- | ---------------------------- | -------------------- | ------------------------ |
-| Resources (`IResource`)    | IndexedDB (`IStorageEngine`) | ✅                   | ✅                       |
-| Media blobs                | OPFS (`IMediaStore`)         | ✅                   | ✅                       |
-| Session + embedded metrics | `chrome.storage.local`       | ✅                   | ✅                       |
-| Scheduler queue            | `chrome.storage.local`       | ✅                   | ✅                       |
-| Diagnostics snapshot       | `chrome.storage.local`       | ✅                   | ✅                       |
+| Data                       | Store                            | Survives SW eviction | Survives browser restart |
+| -------------------------- | -------------------------------- | -------------------- | ------------------------ |
+| Resources (`IResource`)    | IndexedDB (`IStorageEngine`)     | ✅                   | ✅                       |
+| Media blobs                | OPFS (`IMediaStore`)             | ✅                   | ✅                       |
+| Session + embedded metrics | IndexedDB (`IControlStateStore`) | ✅                   | ✅                       |
+| Scheduler queue            | IndexedDB (`IControlStateStore`) | ✅                   | ✅                       |
+| Diagnostics snapshot       | IndexedDB (`IControlStateStore`) | ✅                   | ✅                       |
 
-> Control state (session/queue/diagnostics) uses `chrome.storage.local` rather
-> than the IndexedDB auxiliary stores: it is small, frequently written, and this
-> avoids coupling the control subsystems to the concrete engine. The IndexedDB
-> `sessions`/`diagnostics`/`crawlState` stores remain available for future
-> session-history / export features.
+> Beta-0 Phase 3.5 unified persistence: all durable state lives in IndexedDB
+> (resources via `IStorageEngine`, control state via `IControlStateStore`) or
+> OPFS (media blobs via `IMediaStore`). One substrate, one migration regime, one
+> transactional context. `chrome.storage.local` is reserved for future user
+> preferences and feature flags. The composition root runs a one-shot migration
+> at startup to lift any legacy Phase-3 keys out of `chrome.storage.local`.
 
 ### Recovery lifecycle
 
