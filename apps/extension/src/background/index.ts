@@ -18,6 +18,7 @@ import {
   IMediaStore,
 } from '@knowledge-extractor/types';
 import { CrawlController } from './crawl-controller.js';
+import { MediaCaptureCoordinator, type ICaptureTransport } from './media-capture.js';
 import { InstagramConnector } from '@knowledge-extractor/connector-instagram';
 import {
   IndexedDbStorageEngine,
@@ -85,13 +86,38 @@ if (!idbEngine) {
 }
 
 // Durable media store (bytes in OPFS). Falls back to a volatile in-memory blob
-// backend where OPFS is unavailable. Owned here; consumed by later phases.
+// backend where OPFS is unavailable.
 const mediaStore: IMediaStore = new MediaStore(
   OpfsBlobBackend.isSupported() ? new OpfsBlobBackend() : new InMemoryBlobBackend(),
 );
 if (!OpfsBlobBackend.isSupported()) {
   logger.warn('OPFS unavailable — media store using volatile in-memory backend');
 }
+
+/**
+ * Capture transport: forwards the controller's request to the active tab's
+ * content script, which is the only context with the authenticated Instagram
+ * session. Kept inline (no new exported abstraction) — the coordinator depends
+ * on the small `ICaptureTransport` interface; this is its sole production impl.
+ */
+const captureTransport: ICaptureTransport = {
+  async capture(items) {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tabId = tabs[0]?.id;
+    if (typeof tabId !== 'number') {
+      return {
+        success: false,
+        captured: [],
+        failed: items.map((i) => ({ id: i.id, error: 'No active tab' })),
+      };
+    }
+    return (await chrome.tabs.sendMessage(tabId, {
+      action: 'CAPTURE_MEDIA',
+      data: { mediaItems: items },
+    })) as Awaited<ReturnType<ICaptureTransport['capture']>>;
+  },
+};
+const mediaCapture = new MediaCaptureCoordinator(captureTransport, mediaStore);
 
 const controller = new CrawlController(
   metrics,
@@ -100,6 +126,7 @@ const controller = new CrawlController(
   storage,
   controlStore,
   mediaStore,
+  mediaCapture,
 );
 
 /** Requests durable (non-evictable) storage. Best-effort; safe if unsupported. */

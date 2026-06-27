@@ -32,10 +32,18 @@ Extractor (InstagramConnector.extract — content script)
     ↓
 Normalizer (InstagramConnector.normalize — background)
     │ InstagramParser.enrich → InstagramNormalizer.normalize
-    │ Maps raw post to IResource (domain model)
+    │ Maps raw post to IResource (domain model, ResourceState.EXTRACTED)
     ↓
-Persistence (InMemoryStorage.saveResource — background)
-    │ Saves IResource inside a transaction
+Capture (MediaCaptureCoordinator — background, content script for bytes)
+    │ Asks content script to fetch each IMedia.sourceUri with the
+    │   authenticated session (CAPTURE_MEDIA)
+    │ Persists bytes via IMediaStore (OPFS); stamps localUri on each item
+    │ Hydrates carousel children recursively
+    │ Promotes ResourceState → HYDRATED iff every present media item landed
+    │ Total failure → throws and routes to handleTaskFailure (retry)
+    ↓
+Persistence (IStorageEngine.saveResource — background)
+    │ Saves the (possibly HYDRATED) IResource inside a buffered transaction
     │ MetricsCollector.recordPersisted
     ↓
 Metrics (MetricsCollector — background)
@@ -54,18 +62,19 @@ Popup (stateless dashboard — popup context)
 
 ## Stage ownership
 
-| Stage         | Owner                          | Context        | File                                                |
-| ------------- | ------------------------------ | -------------- | --------------------------------------------------- |
-| Discovery     | `DiscoveryEngine`              | Content script | `connectors/instagram/src/discovery-engine.ts`      |
-| Queue         | `CrawlController`              | Background     | `apps/extension/src/background/crawl-controller.ts` |
-| Scheduling    | `Scheduler`                    | Background     | `apps/extension/src/background/scheduler.ts`        |
-| Navigation    | `Navigator`                    | Content script | `apps/extension/src/content/navigator.ts`           |
-| Extraction    | `InstagramConnector.extract`   | Content script | `connectors/instagram/src/index.ts`                 |
-| Normalization | `InstagramConnector.normalize` | Background     | `connectors/instagram/src/index.ts`                 |
-| Persistence   | `InMemoryStorage`              | Background     | `packages/storage/src/memory-storage.ts`            |
-| Metrics       | `MetricsCollector`             | Background     | `packages/shared/src/metrics-collector.ts`          |
-| Diagnostics   | `DiagnosticsCollector`         | Background     | `packages/shared/src/diagnostics-collector.ts`      |
-| Monitoring    | Popup                          | Popup          | `apps/extension/src/popup/index.tsx`                |
+| Stage         | Owner                          | Context                      | File                                                                                     |
+| ------------- | ------------------------------ | ---------------------------- | ---------------------------------------------------------------------------------------- |
+| Discovery     | `DiscoveryEngine`              | Content script               | `connectors/instagram/src/discovery-engine.ts`                                           |
+| Queue         | `CrawlController`              | Background                   | `apps/extension/src/background/crawl-controller.ts`                                      |
+| Scheduling    | `Scheduler`                    | Background                   | `apps/extension/src/background/scheduler.ts`                                             |
+| Navigation    | `Navigator`                    | Content script               | `apps/extension/src/content/navigator.ts`                                                |
+| Extraction    | `InstagramConnector.extract`   | Content script               | `connectors/instagram/src/index.ts`                                                      |
+| Normalization | `InstagramConnector.normalize` | Background                   | `connectors/instagram/src/index.ts`                                                      |
+| Capture       | `MediaCaptureCoordinator`      | Background + content (fetch) | `apps/extension/src/background/media-capture.ts` + `apps/extension/src/content/index.ts` |
+| Persistence   | `IndexedDbStorageEngine`       | Background                   | `packages/storage/src/indexeddb/indexeddb-storage.ts`                                    |
+| Metrics       | `MetricsCollector`             | Background                   | `packages/shared/src/metrics-collector.ts`                                               |
+| Diagnostics   | `DiagnosticsCollector`         | Background                   | `packages/shared/src/diagnostics-collector.ts`                                           |
+| Monitoring    | Popup                          | Popup                        | `apps/extension/src/popup/index.tsx`                                                     |
 
 ## Infinite scroll
 
@@ -93,6 +102,7 @@ Derived from the pipeline stage where the error occurred:
 | ------------- | ----------------------- |
 | Navigation    | `selector_failure`      |
 | Extraction    | `parsing_failure`       |
+| Capture       | `network_error`         |
 | Normalization | `normalization_failure` |
 
 Every failure is recorded to `DiagnosticsCollector` with `targetUri`, `category`,

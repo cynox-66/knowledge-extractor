@@ -17,9 +17,10 @@ import {
 import { InstagramConnector } from '@knowledge-extractor/connector-instagram';
 import { SessionManager } from './session-manager.js';
 import { Scheduler } from './scheduler.js';
+import { MediaCaptureCoordinator } from './media-capture.js';
 
 /** Pipeline stage, used to categorize failures without bespoke error classes. */
-type Stage = 'navigation' | 'extraction' | 'normalization';
+type Stage = 'navigation' | 'extraction' | 'normalization' | 'capture';
 
 /** The shape the content script returns from EXTRACT_RESOURCE. */
 interface ExtractResponse {
@@ -64,8 +65,10 @@ export class CrawlController {
   private readonly connector: InstagramConnector;
   private readonly storage: IStorageEngine;
   private readonly controlStore: IControlStateStore;
-  /** Durable media store. Owned here for later phases; not consumed in Beta-0. */
+  /** Durable media store; consumed by `mediaCapture` (Beta-1). */
   private readonly mediaStore: IMediaStore;
+  /** Captures media bytes between normalization and resource persistence. */
+  private readonly mediaCapture: MediaCaptureCoordinator;
 
   private loopTimer: ReturnType<typeof setTimeout> | null = null;
   private isProcessing = false;
@@ -78,6 +81,7 @@ export class CrawlController {
     storage: IStorageEngine,
     controlStore: IControlStateStore,
     mediaStore: IMediaStore,
+    mediaCapture: MediaCaptureCoordinator,
   ) {
     this.metrics = metrics;
     this.diagnostics = diagnostics;
@@ -85,6 +89,7 @@ export class CrawlController {
     this.storage = storage;
     this.controlStore = controlStore;
     this.mediaStore = mediaStore;
+    this.mediaCapture = mediaCapture;
     this.sessionManager = new SessionManager(metrics, controlStore);
   }
 
@@ -303,6 +308,34 @@ export class CrawlController {
       this.metrics.recordNormalized(performance.now() - normStart);
       this.broadcastEvent('RESOURCE_NORMALIZED', { resourceId: normalized.id });
 
+      // --- Capture ---
+      // Hydrate media bytes from the authenticated tab into the MediaStore
+      // BEFORE persisting the resource, so the on-disk record reflects the
+      // bytes actually captured (`localUri`, `state=HYDRATED` when complete).
+      stage = 'capture';
+      await this.sessionManager.update({ navigationStatus: 'capturing' });
+      const captureOutcome = await this.mediaCapture.hydrate(normalized);
+      for (const failure of captureOutcome.failures) {
+        this.diagnostics.recordFailure(
+          failure.sourceUri,
+          'selector_failure',
+          `Media capture failed: ${failure.reason}`,
+          { failingStrategy: 'capture' },
+        );
+      }
+      // If we attempted to fetch media but landed nothing, treat the whole
+      // task as a capture failure — retry path handles transient errors.
+      const attemptedCapture = captureOutcome.persisted + captureOutcome.failures.length > 0;
+      if (attemptedCapture && captureOutcome.persisted === 0) {
+        throw new Error(`Media capture failed for all ${captureOutcome.failures.length} item(s)`);
+      }
+      this.broadcastEvent('RESOURCE_HYDRATED', {
+        resourceId: normalized.id,
+        persisted: captureOutcome.persisted,
+        failed: captureOutcome.failures.length,
+        skipped: captureOutcome.skipped,
+      });
+
       // --- Persistence ---
       const tx = await this.storage.beginTransaction();
       await this.storage.saveResource(normalized, tx);
@@ -333,7 +366,9 @@ export class CrawlController {
     const message = err instanceof Error ? err.message : String(err);
     const domSnapshot = err instanceof ExtractFailure ? err.domSnapshot : undefined;
 
-    // Stage-specific failure counters.
+    // Stage-specific failure counters. Capture failures share the
+    // post-extraction failure counter (the metric set is frozen at Layer 0;
+    // the per-stage label flows through the diagnostic record).
     if (stage === 'navigation') this.metrics.recordNavigationFailure();
     else if (stage === 'extraction') this.metrics.recordExtractionFailure();
     else this.metrics.recordNormalizationFailure();
@@ -365,6 +400,7 @@ export class CrawlController {
   private categoryFor(stage: Stage): FailureCategory {
     if (stage === 'navigation') return 'selector_failure';
     if (stage === 'extraction') return 'parsing_failure';
+    if (stage === 'capture') return 'network_error';
     return 'normalization_failure';
   }
 

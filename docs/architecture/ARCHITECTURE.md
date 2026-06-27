@@ -122,8 +122,20 @@ interface, never the concrete class. See [STORAGE.md](STORAGE.md).
 ### MediaStore (`packages/storage/src/media`)
 
 Durable binary media persistence (`IMediaStore`), owned by the composition root
-and injected into `CrawlController`. **Not consumed in Beta-0** — exposed via
-`CrawlController.getMediaStore()` for the Beta-1 media-capture / OCR pipeline.
+and injected into `CrawlController`. As of Beta-1, consumed by the
+`MediaCaptureCoordinator`: media bytes captured during a crawl are persisted to
+OPFS via this contract, and the resulting `IMediaMetadata.storagePath` is
+stamped onto `IMedia.localUri`.
+
+### MediaCaptureCoordinator (`apps/extension/src/background/media-capture.ts`)
+
+Drives media hydration for one resource. Pipeline position: after normalization,
+before resource persistence. Asks the content script (the only context with the
+authenticated Instagram session) to fetch each `IMedia.sourceUri`, persists the
+bytes via `IMediaStore`, stamps `localUri`, and promotes `ResourceState` to
+`HYDRATED` when every present media item has landed. Carousel children
+(`IResource.children`) are hydrated recursively. Skips `MediaType.VIDEO` and
+inline `data:`/`blob:` URIs (out-of-scope for Beta-1). Idempotent on retry.
 
 ### Popup (`apps/extension/src/popup/index.tsx`)
 
