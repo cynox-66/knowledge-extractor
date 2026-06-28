@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   IResource,
   IResourceQueryable,
@@ -668,5 +668,255 @@ describe('EnrichmentLoop — cursor checkpointing: cleared after completion', ()
 
     expect(report.completedCleanly).toBe(false);
     expect(deleteSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 4C — Self-rescheduling
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal chrome.alarms mock. Stubbed globally so EnrichmentLoop's
+ * `start()` / `stop()` / `_trigger()` calls succeed in a Node environment.
+ */
+function makeChromeMock(): {
+  alarms: {
+    create: ReturnType<typeof vi.fn>;
+    clear: ReturnType<typeof vi.fn>;
+  };
+} {
+  return {
+    alarms: {
+      create: vi.fn(),
+      clear: vi.fn().mockResolvedValue(true),
+    },
+  };
+}
+
+describe('EnrichmentLoop — self-rescheduling: schedules next pass after completion', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('creates an alarm after a clean pass completes', async () => {
+    const chromeMock = makeChromeMock();
+    vi.stubGlobal('chrome', chromeMock);
+
+    const loop = new EnrichmentLoop(new InMemoryQueryable([]), new StubMediaStore());
+    loop.start(5);
+
+    await vi.waitFor(() => {
+      expect(chromeMock.alarms.create).toHaveBeenCalledWith(EnrichmentLoop.ALARM_NAME, {
+        delayInMinutes: 5,
+      });
+    });
+
+    loop.stop();
+  });
+
+  it('uses the configured interval when scheduling the next alarm', async () => {
+    const chromeMock = makeChromeMock();
+    vi.stubGlobal('chrome', chromeMock);
+
+    const loop = new EnrichmentLoop(new InMemoryQueryable([]), new StubMediaStore());
+    loop.start(10);
+
+    await vi.waitFor(() => {
+      expect(chromeMock.alarms.create).toHaveBeenCalledWith(EnrichmentLoop.ALARM_NAME, {
+        delayInMinutes: 10,
+      });
+    });
+
+    loop.stop();
+  });
+
+  it('does not schedule next alarm when the pass fails (storage error)', async () => {
+    const chromeMock = makeChromeMock();
+    vi.stubGlobal('chrome', chromeMock);
+
+    const loop = new EnrichmentLoop(new ThrowingQueryable(), new StubMediaStore());
+    loop.start(5);
+
+    // Allow microtasks and timers to settle
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(chromeMock.alarms.create).not.toHaveBeenCalled();
+
+    loop.stop();
+  });
+});
+
+describe('EnrichmentLoop — self-rescheduling: duplicate scheduling prevented', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('start() is idempotent — a second call before the first pass completes is ignored', async () => {
+    // Hoist the resolver so it is available before runPass() calls queryResources().
+    let resolveQuery!: (result: IEnrichmentSelection) => void;
+    const queryPromise = new Promise<IEnrichmentSelection>((resolve) => {
+      resolveQuery = resolve;
+    });
+    const controlledQueryable: IResourceQueryable = {
+      queryResources: () => queryPromise,
+    };
+
+    const chromeMock = makeChromeMock();
+    vi.stubGlobal('chrome', chromeMock);
+
+    const loop = new EnrichmentLoop(controlledQueryable, new StubMediaStore());
+    const runPassSpy = vi.spyOn(loop, 'runPass');
+
+    loop.start(5);
+    loop.start(5); // second call must be a no-op
+
+    // Only one pass should have been initiated
+    expect(runPassSpy).toHaveBeenCalledTimes(1);
+
+    resolveQuery({ items: [], hasMore: false });
+    await vi.waitFor(() => expect(chromeMock.alarms.create).toHaveBeenCalledTimes(1));
+
+    loop.stop();
+  });
+});
+
+describe('EnrichmentLoop — self-rescheduling: concurrency control', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('skips concurrent alarm triggers while a pass is already in progress', async () => {
+    let resolveQuery!: (result: IEnrichmentSelection) => void;
+    const queryPromise = new Promise<IEnrichmentSelection>((resolve) => {
+      resolveQuery = resolve;
+    });
+    const slowQueryable: IResourceQueryable = {
+      queryResources: () => queryPromise,
+    };
+
+    const chromeMock = makeChromeMock();
+    vi.stubGlobal('chrome', chromeMock);
+
+    const loop = new EnrichmentLoop(slowQueryable, new StubMediaStore());
+    const runPassSpy = vi.spyOn(loop, 'runPass');
+
+    loop.start(5);
+    // First pass is in progress (queryResources promise not yet resolved)
+
+    loop.handleAlarm(); // must be ignored — pass in progress
+    loop.handleAlarm(); // must be ignored — pass in progress
+
+    // runPass should still only have been called once
+    expect(runPassSpy).toHaveBeenCalledTimes(1);
+
+    // Release the pass and verify the alarm is created afterwards
+    resolveQuery({ items: [], hasMore: false });
+    await vi.waitFor(() => expect(chromeMock.alarms.create).toHaveBeenCalledTimes(1));
+
+    loop.stop();
+  });
+});
+
+describe('EnrichmentLoop — self-rescheduling: alarm-triggered execution', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('handleAlarm() triggers a new pass after the previous pass has completed', async () => {
+    const chromeMock = makeChromeMock();
+    vi.stubGlobal('chrome', chromeMock);
+
+    const handler = vi.fn().mockResolvedValue(undefined);
+    const resources = [makeResource('r1', { mediaIds: [] })];
+    const loop = new EnrichmentLoop(
+      new InMemoryQueryable(resources),
+      new StubMediaStore(),
+      handler,
+    );
+
+    loop.start(5);
+
+    // Wait for the first pass to finish
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(chromeMock.alarms.create).toHaveBeenCalledTimes(1));
+
+    // Simulate the alarm firing
+    loop.handleAlarm();
+
+    // A second pass should run
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(2));
+
+    loop.stop();
+  });
+
+  it('handleAlarm() is a no-op when the loop has not been started', () => {
+    const chromeMock = makeChromeMock();
+    vi.stubGlobal('chrome', chromeMock);
+
+    const loop = new EnrichmentLoop(new InMemoryQueryable([]), new StubMediaStore());
+    const runPassSpy = vi.spyOn(loop, 'runPass');
+
+    loop.handleAlarm(); // should not trigger anything
+
+    expect(runPassSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('EnrichmentLoop — self-rescheduling: stop', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('stop() clears the pending alarm immediately', () => {
+    const chromeMock = makeChromeMock();
+    vi.stubGlobal('chrome', chromeMock);
+
+    const loop = new EnrichmentLoop(new InMemoryQueryable([]), new StubMediaStore());
+    loop.start(5);
+    loop.stop();
+
+    expect(chromeMock.alarms.clear).toHaveBeenCalledWith(EnrichmentLoop.ALARM_NAME);
+  });
+
+  it('stop() prevents alarm creation even when a pass completes cleanly afterwards', async () => {
+    let resolveQuery!: (result: IEnrichmentSelection) => void;
+    const queryPromise = new Promise<IEnrichmentSelection>((resolve) => {
+      resolveQuery = resolve;
+    });
+    const controlledQueryable: IResourceQueryable = {
+      queryResources: () => queryPromise,
+    };
+
+    const chromeMock = makeChromeMock();
+    vi.stubGlobal('chrome', chromeMock);
+
+    const loop = new EnrichmentLoop(controlledQueryable, new StubMediaStore());
+    loop.start(5);
+    loop.stop(); // deactivate before the in-flight pass finishes
+
+    // Let the pass complete
+    resolveQuery({ items: [], hasMore: false });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // _active is false — no alarm should have been created
+    expect(chromeMock.alarms.create).not.toHaveBeenCalled();
+  });
+
+  it('stop() prevents handleAlarm() from starting a new pass', async () => {
+    const chromeMock = makeChromeMock();
+    vi.stubGlobal('chrome', chromeMock);
+
+    const loop = new EnrichmentLoop(new InMemoryQueryable([]), new StubMediaStore());
+    const runPassSpy = vi.spyOn(loop, 'runPass');
+
+    loop.start(5);
+    await vi.waitFor(() => expect(chromeMock.alarms.create).toHaveBeenCalledTimes(1));
+
+    loop.stop();
+    loop.handleAlarm(); // should be a no-op after stop
+
+    // Wait to confirm no additional pass starts
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(runPassSpy).toHaveBeenCalledTimes(1);
   });
 });

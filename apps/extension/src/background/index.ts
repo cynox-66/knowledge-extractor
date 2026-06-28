@@ -214,13 +214,7 @@ async function startup(): Promise<void> {
     .catch((err) => logger.warn('MediaStore cleanup failed (non-fatal)', err))
     .then(() => {
       if (enrichmentLoop !== null) {
-        enrichmentLoop
-          .runPass()
-          .then((report) => {
-            logger.info('Enrichment pass complete', report);
-            return ocrEngine?.terminate();
-          })
-          .catch((err) => logger.error('Enrichment pass unexpectedly threw', err));
+        enrichmentLoop.start();
       }
     });
 }
@@ -231,6 +225,9 @@ startup().catch((err) => logger.error('Startup failed', err));
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === CrawlController.ALARM_NAME) {
     controller.resumeFromAlarm().catch((err) => logger.error('Alarm resume failed', err));
+  }
+  if (alarm.name === EnrichmentLoop.ALARM_NAME) {
+    enrichmentLoop?.handleAlarm();
   }
 });
 

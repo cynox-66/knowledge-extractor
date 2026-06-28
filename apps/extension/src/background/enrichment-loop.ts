@@ -40,7 +40,12 @@ function yieldToEventLoop(): Promise<void> {
  * OCR engine; in Phase 3 it defaults to a no-op.
  */
 export class EnrichmentLoop {
+  static readonly ALARM_NAME = 'ke-enrichment-tick';
+
   private readonly logger = new Logger('EnrichmentLoop');
+  private _active = false;
+  private _passInProgress = false;
+  private _intervalMinutes = 5;
 
   constructor(
     private readonly queryable: IResourceQueryable,
@@ -48,6 +53,36 @@ export class EnrichmentLoop {
     private readonly onWorkItem: (item: IEnrichmentWorkItem) => Promise<void> = async () => {},
     private readonly controlStateStore?: IControlStateStore,
   ) {}
+
+  /**
+   * Activates the self-scheduling loop. Runs the first pass immediately and
+   * schedules a `chrome.alarms` watchdog after each clean completion so the
+   * loop survives MV3 service worker suspension. Idempotent: repeated calls
+   * before the first pass completes are ignored.
+   */
+  start(intervalMinutes = 5): void {
+    if (this._active) return;
+    this._active = true;
+    this._intervalMinutes = intervalMinutes;
+    this._trigger();
+  }
+
+  /**
+   * Deactivates the loop. Any in-flight pass runs to completion but no further
+   * alarm is created afterwards. Clears any pending alarm immediately.
+   */
+  stop(): void {
+    this._active = false;
+    void chrome.alarms.clear(EnrichmentLoop.ALARM_NAME);
+  }
+
+  /**
+   * Called by the alarm listener in `index.ts` when `ALARM_NAME` fires.
+   * Triggers the next pass unless one is already in progress.
+   */
+  handleAlarm(): void {
+    this._trigger();
+  }
 
   /**
    * Executes one complete reconciliation pass and returns a structured report.
@@ -157,5 +192,28 @@ export class EnrichmentLoop {
       completedCleanly,
       ...(errorMessage !== undefined ? { error: errorMessage } : {}),
     };
+  }
+
+  /**
+   * Runs the pass if the loop is active and no pass is currently in flight.
+   * On clean completion, creates the next `chrome.alarms` watchdog so the
+   * loop self-reschedules across MV3 service worker suspensions.
+   */
+  private _trigger(): void {
+    if (!this._active || this._passInProgress) return;
+    this._passInProgress = true;
+    this.runPass()
+      .then((report) => {
+        this._passInProgress = false;
+        if (report.completedCleanly && this._active) {
+          chrome.alarms.create(EnrichmentLoop.ALARM_NAME, {
+            delayInMinutes: this._intervalMinutes,
+          });
+        }
+      })
+      .catch((err) => {
+        this._passInProgress = false;
+        this.logger.error('Enrichment pass unexpectedly threw', err);
+      });
   }
 }
