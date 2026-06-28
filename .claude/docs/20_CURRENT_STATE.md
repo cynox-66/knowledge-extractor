@@ -1,16 +1,19 @@
 # Current State Dashboard
 
 ## Current Milestone
-Beta-1 (Milestone 1.5)
+Beta-2 (OCR Engine)
 
 ## Current Objective
-Implement Enrichment Read Path, Resource Enumeration, Media Reconciliation, and Cleanup wiring to feed `HYDRATED` resources into the OCR pipeline.
+Integrate Tesseract.js OCR to process reconciled media blobs emitted by `EnrichmentLoop`,
+writing transcription results back to `IResource` and advancing resources from
+`HYDRATED` → `ENRICHED`.
 
 ## Completed Milestones
 - Alpha Stabilization (Sprints A0-A4)
 - Beta-0 Phase 3.5 (Unified Persistence: IndexedDB + OPFS)
 - MV3 Lifecycle & Orchestration Stabilization
 - Extraction Unification
+- **Beta-1.5 (Enrichment Read Path)** — COMPLETE
 
 ## Active Branch
 `main`
@@ -19,24 +22,37 @@ Implement Enrichment Read Path, Resource Enumeration, Media Reconciliation, and 
 None.
 
 ## Recent Engineering Changes
-- Integrated `IndexedDbStorageEngine` replacing `InMemoryStorage`.
-- Added OPFS blob backend and `MediaCaptureCoordinator`.
-- Purged outdated historical documentation and established `.claude/docs` source of truth.
-- **Beta-1 Phase 1:** Added `IResourceQuery`, `IEnrichmentSelection`, and `IResourceQueryable` contracts to `packages/types`.
-- **Beta-1 Phase 2:** Implemented `IResourceQueryable` on `IndexedDbStorageEngine`. Schema bumped to v2 with `by_state` index on `resources.state`. `queryResources()` uses `continuePrimaryKey` cursor for O(pageSize) bounded-memory pagination.
-- **Beta-1 Phase 3:** Implemented `EnrichmentLoop` in `apps/extension/src/background/enrichment-loop.ts`. Wired into startup: runs a reconciliation pass after `controller.init()`, produces `IReconciliationReport`, yields between pages via `setTimeout(0)`. `MediaStore.cleanup()` runs as a best-effort startup task.
+- **Beta-1.5 Phase 1:** Added `IResourceQuery`, `IEnrichmentSelection`, and `IResourceQueryable`
+  contracts to `packages/types`. Added `IReconciliationReport` and `IEnrichmentWorkItem`.
+- **Beta-1.5 Phase 2:** Implemented `IResourceQueryable` on `IndexedDbStorageEngine`. Schema
+  bumped to v2 with `by_state` secondary index on `resources.state`. `queryResources()` uses
+  `continuePrimaryKey` cursor for O(pageSize) bounded-memory pagination.
+- **Beta-1.5 Phase 3:** Implemented `EnrichmentLoop` with MV3-safe per-page `setTimeout(0)`
+  yielding. Produces `IReconciliationReport`. Wired into startup after `controller.init()`.
+  `MediaStore.cleanup()` runs sequentially before `runPass()` to eliminate index race.
+- **Beta-1.5 Post-review fixes:** Added `resourcesFailed` counter to `IReconciliationReport`;
+  per-item `onWorkItem` failures now increment `resourcesFailed` and continue rather than
+  aborting the entire pass. Sequential `cleanup() → runPass()` startup ordering replaces
+  the previous concurrent fire-and-forget.
 
 ## Current Risks
-- **Discovery Performance:** `MutationObserver` currently scans the entire document body, causing quadratic scaling on very large collections.
-- **OCR Integration:** Phase 4 must replace the no-op `onWorkItem` stub with the Tesseract.js OCR engine without modifying `EnrichmentLoop` itself.
+- **Discovery Performance:** `MutationObserver` currently scans the entire document body,
+  causing quadratic scaling on very large collections.
+- **Enrichment cursor not checkpointed:** The enrichment pass restarts from the beginning on
+  every service worker activation. Acceptable without OCR (pass is fast); becomes a blocking
+  concern once OCR is wired (multi-minute passes lost on eviction). Must be addressed in Beta-2.
 
 ## Current Technical Debt
 - `Scheduler` and `MetricsCollector` lack automated unit test coverage.
-- Legacy message bus uses raw string actions instead of strictly typed event unions across the board.
-- `EnrichmentLoop` runs exactly once at startup; it does not self-reschedule (deferred to Phase 4 / alarm integration).
+- Legacy message bus uses raw string actions instead of strictly typed event unions.
+- `EnrichmentLoop` runs once at startup; does not self-reschedule via alarms (deferred to Beta-2).
+- Enrichment cursor position not persisted to `IControlStateStore` across worker evictions.
+- `IReconciliationReport` is logged but not persisted — no observable history of passes.
 
 ## Next Engineering Step
-Beta-2: OCR Engine integration — replace the no-op `onWorkItem` stub with Tesseract.js, processing reconciled `IEnrichmentWorkItem` blobs.
+Beta-2: OCR Engine integration. See `40_NEXT_TASK.md` for full scope and pre-conditions.
 
 ## Definition of Current Success
-The crawler consistently extracts and hydrates resources into IndexedDB/OPFS across a 100+ item scroll without MV3 eviction, duplicate data, or missing metrics.
+The crawler consistently extracts and hydrates resources into IndexedDB/OPFS across a 100+ item
+scroll without MV3 eviction, duplicate data, or missing metrics. Enrichment reconciliation pass
+runs to completion and produces a valid `IReconciliationReport` on every worker activation.
