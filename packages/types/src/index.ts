@@ -8,3 +8,4 @@ export * from './messaging/index.js';
 export * from './errors/index.js';
 export * from './events/index.js';
 export * from './diagnostics/index.js';
+export * from './enrichment/index.js';
