@@ -52,6 +52,16 @@ export interface IReconciliationReport {
    * (e.g. wrong lifecycle state, or `completeness.media` is false).
    */
   resourcesSkipped: number;
+  /**
+   * Resources for which the enrichment handler threw an unhandled error.
+   * These are not counted in {@link resourcesReady} or
+   * {@link resourcesWithMissingMedia} — they form a distinct, mutually
+   * exclusive category so that the invariant
+   * `resourcesEnumerated === resourcesReady + resourcesWithMissingMedia + resourcesSkipped + resourcesFailed`
+   * always holds.  A non-zero value does not mark the pass as incomplete;
+   * the storage enumeration still ran to completion.
+   */
+  resourcesFailed: number;
   /** `true` if the pass ran to completion without an unhandled error. */
   completedCleanly: boolean;
   /** Populated with the error message when {@link completedCleanly} is `false`. */

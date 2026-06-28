@@ -1,14 +1,24 @@
 import {
   IStorageEngine,
   IControlStateStore,
+  IResourceQueryable,
+  IResourceQuery,
+  IEnrichmentSelection,
   ITransaction,
   IResource,
   ICrawlSession,
   ISessionReport,
 } from '@knowledge-extractor/types';
 import { Logger } from '@knowledge-extractor/shared';
-import { openDatabase, readRecord, listRecords, writeRecord, deleteRecord } from './database.js';
-import { STORES } from './schema.js';
+import {
+  openDatabase,
+  readRecord,
+  listRecords,
+  writeRecord,
+  deleteRecord,
+  queryByIndex,
+} from './database.js';
+import { STORES, RESOURCE_STATE_INDEX } from './schema.js';
 import { BufferedTransaction } from './transaction.js';
 
 /**
@@ -23,7 +33,9 @@ import { BufferedTransaction } from './transaction.js';
  *
  * The connection is opened lazily and memoized.
  */
-export class IndexedDbStorageEngine implements IStorageEngine, IControlStateStore {
+export class IndexedDbStorageEngine
+  implements IStorageEngine, IControlStateStore, IResourceQueryable
+{
   private readonly logger = new Logger('IndexedDbStorage');
   private dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -90,6 +102,20 @@ export class IndexedDbStorageEngine implements IStorageEngine, IControlStateStor
   async listResources(): Promise<IResource[]> {
     const db = await this.db();
     return listRecords<IResource>(db, STORES.RESOURCES);
+  }
+
+  // ---- IResourceQueryable (paginated state-filtered enumeration) -----------
+
+  async queryResources(query: IResourceQuery): Promise<IEnrichmentSelection> {
+    const db = await this.db();
+    return queryByIndex<IResource>(
+      db,
+      STORES.RESOURCES,
+      RESOURCE_STATE_INDEX,
+      query.state,
+      query.pageSize,
+      query.cursor,
+    );
   }
 
   // ---- IControlStateStore (sessions, diagnostics, crawl state) -------------

@@ -130,3 +130,83 @@ export async function deleteRecord(
   tx.objectStore(store).delete(key);
   await awaitTransaction(tx);
 }
+
+/**
+ * Paginated cursor query over a secondary index.
+ *
+ * Opens a readonly cursor on `indexName` filtered to `indexValue` and collects
+ * up to `pageSize` records. When `afterId` is provided (the primary key of the
+ * last item from the previous page), the cursor seeks to that position and
+ * advances one step past it before collecting. If the record identified by
+ * `afterId` has been deleted since the previous page was fetched, the cursor
+ * lands on the first surviving record after that key — no items are skipped.
+ *
+ * Items are returned in primary-key (lexicographic) order within the index key.
+ *
+ * @param T  Record type; must expose an `id: string` primary key field.
+ */
+export function queryByIndex<T extends { id: string }>(
+  db: IDBDatabase,
+  store: StoreName,
+  indexName: string,
+  indexValue: IDBValidKey,
+  pageSize: number,
+  afterId?: string,
+): Promise<{ items: T[]; nextCursor?: string; hasMore: boolean }> {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readonly');
+    const index = tx.objectStore(store).index(indexName);
+    const req = index.openCursor(IDBKeyRange.only(indexValue));
+
+    const items: T[] = [];
+    // phase drives the state machine across successive onsuccess callbacks.
+    // seek → (continuePrimaryKey issued) → skip → (cursor verified / advanced) → collect → done
+    let phase: 'seek' | 'skip' | 'collect' | 'done' = afterId !== undefined ? 'seek' : 'collect';
+
+    req.onsuccess = () => {
+      const cursor = req.result;
+
+      if (phase === 'done') return;
+
+      if (!cursor) {
+        resolve({ items, hasMore: false });
+        return;
+      }
+
+      if (phase === 'seek') {
+        // continuePrimaryKey advances to the first record where
+        // (indexKey, primaryKey) >= (indexValue, afterId).
+        cursor.continuePrimaryKey(indexValue, afterId!);
+        phase = 'skip';
+        return;
+      }
+
+      if (phase === 'skip') {
+        phase = 'collect';
+        if (String(cursor.primaryKey) === afterId) {
+          // Cursor landed exactly on the already-seen record; step past it.
+          cursor.continue();
+          return;
+        }
+        // afterId no longer exists; cursor is already past it — fall through.
+      }
+
+      // phase === 'collect'
+      if (items.length < pageSize) {
+        items.push(cursor.value as T);
+        cursor.continue();
+      } else {
+        // items is full and cursor is at the (pageSize + 1)-th record,
+        // confirming there are more pages.
+        resolve({
+          items,
+          nextCursor: items[items.length - 1].id,
+          hasMore: true,
+        });
+        phase = 'done';
+      }
+    };
+
+    req.onerror = () => reject(req.error ?? new Error('Index cursor query failed'));
+  });
+}

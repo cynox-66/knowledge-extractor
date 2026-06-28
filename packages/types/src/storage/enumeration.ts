@@ -41,3 +41,20 @@ export interface IEnrichmentSelection {
   /** Whether more pages exist after this one. */
   hasMore: boolean;
 }
+
+/**
+ * Additive query capability for storage engines that support indexed resource
+ * enumeration. Kept separate from {@link IStorageEngine} (which remains frozen)
+ * so the contract can be adopted incrementally by other backends.
+ */
+export interface IResourceQueryable {
+  /**
+   * Returns a bounded page of resources matching the given query.
+   *
+   * Callers advance through the full result set by passing the
+   * {@link IEnrichmentSelection.nextCursor} of the previous page as
+   * {@link IResourceQuery.cursor} until {@link IEnrichmentSelection.hasMore}
+   * is `false`.
+   */
+  queryResources(query: IResourceQuery): Promise<IEnrichmentSelection>;
+}

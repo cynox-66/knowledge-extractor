@@ -18,6 +18,7 @@ import {
   IMediaStore,
 } from '@knowledge-extractor/types';
 import { CrawlController } from './crawl-controller.js';
+import { EnrichmentLoop } from './enrichment-loop.js';
 import { MediaCaptureCoordinator, type ICaptureTransport } from './media-capture.js';
 import { InstagramConnector } from '@knowledge-extractor/connector-instagram';
 import {
@@ -129,6 +130,10 @@ const controller = new CrawlController(
   mediaCapture,
 );
 
+// Enrichment loop: only available when IndexedDB is present (idbEngine implements
+// IResourceQueryable). Falls back to null — no enumeration in volatile mode.
+const enrichmentLoop = idbEngine !== null ? new EnrichmentLoop(idbEngine, mediaStore) : null;
+
 /** Requests durable (non-evictable) storage. Best-effort; safe if unsupported. */
 async function requestPersistence(): Promise<void> {
   try {
@@ -189,6 +194,22 @@ async function startup(): Promise<void> {
     });
   }
   await controller.init();
+
+  // Cleanup then enrichment — sequential to prevent a race on the in-memory
+  // media index (cleanup resets it; enrichment reads from it). Both remain
+  // fire-and-forget from startup's perspective: neither blocks controller.init()
+  // completion, and cleanup failure is non-fatal.
+  mediaStore
+    .cleanup()
+    .catch((err) => logger.warn('MediaStore cleanup failed (non-fatal)', err))
+    .then(() => {
+      if (enrichmentLoop !== null) {
+        enrichmentLoop
+          .runPass()
+          .then((report) => logger.info('Enrichment pass complete', report))
+          .catch((err) => logger.error('Enrichment pass unexpectedly threw', err));
+      }
+    });
 }
 
 startup().catch((err) => logger.error('Startup failed', err));

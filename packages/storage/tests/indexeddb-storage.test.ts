@@ -2,7 +2,12 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { IDBFactory } from 'fake-indexeddb';
 import { IResource, ResourceState, MediaType, BlockType } from '@knowledge-extractor/types';
 import { IndexedDbStorageEngine } from '../src/indexeddb/indexeddb-storage.js';
-import { DB_VERSION, META_VERSION_KEY, STORES } from '../src/indexeddb/schema.js';
+import {
+  DB_VERSION,
+  META_VERSION_KEY,
+  STORES,
+  RESOURCE_STATE_INDEX,
+} from '../src/indexeddb/schema.js';
 import { openDatabase, readRecord } from '../src/indexeddb/database.js';
 
 // Reset the global IndexedDB between tests so each runs against a clean backing
@@ -208,6 +213,326 @@ describe('IndexedDbStorageEngine — auxiliary stores', () => {
     const engine = new IndexedDbStorageEngine(uniqueDbName());
     await engine.saveCrawlState('probe', { ok: true });
     expect(await engine.getCrawlState<{ ok: boolean }>('probe')).toEqual({ ok: true });
+    await engine.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Schema v2: by_state index
+// ---------------------------------------------------------------------------
+
+describe('Schema v2 — by_state index', () => {
+  it('creates the by_state index on the resources store', async () => {
+    const name = uniqueDbName();
+    const db = await openDatabase(name, DB_VERSION);
+    const tx = db.transaction(STORES.RESOURCES, 'readonly');
+    expect(tx.objectStore(STORES.RESOURCES).indexNames.contains(RESOURCE_STATE_INDEX)).toBe(true);
+    db.close();
+  });
+
+  it('schema version is recorded as 2', async () => {
+    const name = uniqueDbName();
+    const engine = new IndexedDbStorageEngine(name);
+    await engine.init();
+    await engine.close();
+
+    const db = await openDatabase(name, DB_VERSION);
+    const meta = await readRecord<{ key: string; value: number }>(
+      db,
+      STORES.META,
+      META_VERSION_KEY,
+    );
+    expect(meta?.value).toBe(2);
+    db.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// IResourceQueryable — queryResources
+// ---------------------------------------------------------------------------
+
+describe('IndexedDbStorageEngine — queryResources: empty store', () => {
+  it('returns empty results when no resources exist', async () => {
+    const engine = new IndexedDbStorageEngine(uniqueDbName());
+    const result = await engine.queryResources({ state: ResourceState.HYDRATED, pageSize: 10 });
+    expect(result.items).toHaveLength(0);
+    expect(result.hasMore).toBe(false);
+    expect(result.nextCursor).toBeUndefined();
+    await engine.close();
+  });
+
+  it('returns empty results when no resources match the requested state', async () => {
+    const engine = new IndexedDbStorageEngine(uniqueDbName());
+    await engine.saveResource(makeResource('r1', { state: ResourceState.EXTRACTED }));
+    await engine.saveResource(makeResource('r2', { state: ResourceState.EXTRACTED }));
+
+    const result = await engine.queryResources({ state: ResourceState.HYDRATED, pageSize: 10 });
+    expect(result.items).toHaveLength(0);
+    expect(result.hasMore).toBe(false);
+    await engine.close();
+  });
+});
+
+describe('IndexedDbStorageEngine — queryResources: single page', () => {
+  it('returns all items when total < pageSize', async () => {
+    const engine = new IndexedDbStorageEngine(uniqueDbName());
+    await engine.saveResource(makeResource('h1', { state: ResourceState.HYDRATED }));
+    await engine.saveResource(makeResource('h2', { state: ResourceState.HYDRATED }));
+    await engine.saveResource(makeResource('h3', { state: ResourceState.HYDRATED }));
+
+    const result = await engine.queryResources({ state: ResourceState.HYDRATED, pageSize: 10 });
+    expect(result.items).toHaveLength(3);
+    expect(result.hasMore).toBe(false);
+    expect(result.nextCursor).toBeUndefined();
+    await engine.close();
+  });
+
+  it('returns all items when total === pageSize', async () => {
+    const engine = new IndexedDbStorageEngine(uniqueDbName());
+    await engine.saveResource(makeResource('e1', { state: ResourceState.HYDRATED }));
+    await engine.saveResource(makeResource('e2', { state: ResourceState.HYDRATED }));
+
+    const result = await engine.queryResources({ state: ResourceState.HYDRATED, pageSize: 2 });
+    expect(result.items).toHaveLength(2);
+    expect(result.hasMore).toBe(false);
+    expect(result.nextCursor).toBeUndefined();
+    await engine.close();
+  });
+
+  it('returns a single item when pageSize is 1 and only one record matches', async () => {
+    const engine = new IndexedDbStorageEngine(uniqueDbName());
+    await engine.saveResource(makeResource('only', { state: ResourceState.HYDRATED }));
+
+    const result = await engine.queryResources({ state: ResourceState.HYDRATED, pageSize: 1 });
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0].id).toBe('only');
+    expect(result.hasMore).toBe(false);
+    await engine.close();
+  });
+});
+
+describe('IndexedDbStorageEngine — queryResources: state filtering', () => {
+  it('returns only resources in the requested state', async () => {
+    const engine = new IndexedDbStorageEngine(uniqueDbName());
+    await engine.saveResource(makeResource('h1', { state: ResourceState.HYDRATED }));
+    await engine.saveResource(makeResource('e1', { state: ResourceState.EXTRACTED }));
+    await engine.saveResource(makeResource('h2', { state: ResourceState.HYDRATED }));
+    await engine.saveResource(makeResource('n1', { state: ResourceState.ENRICHED }));
+
+    const result = await engine.queryResources({ state: ResourceState.HYDRATED, pageSize: 20 });
+    expect(result.items).toHaveLength(2);
+    expect(result.items.every((r) => r.state === ResourceState.HYDRATED)).toBe(true);
+    await engine.close();
+  });
+
+  it('returns separate pages for different states independently', async () => {
+    const engine = new IndexedDbStorageEngine(uniqueDbName());
+    for (let i = 0; i < 3; i++) {
+      await engine.saveResource(makeResource(`h${i}`, { state: ResourceState.HYDRATED }));
+      await engine.saveResource(makeResource(`e${i}`, { state: ResourceState.EXTRACTED }));
+    }
+
+    const hydrated = await engine.queryResources({ state: ResourceState.HYDRATED, pageSize: 20 });
+    const extracted = await engine.queryResources({ state: ResourceState.EXTRACTED, pageSize: 20 });
+
+    expect(hydrated.items).toHaveLength(3);
+    expect(extracted.items).toHaveLength(3);
+    expect(hydrated.items.every((r) => r.state === ResourceState.HYDRATED)).toBe(true);
+    expect(extracted.items.every((r) => r.state === ResourceState.EXTRACTED)).toBe(true);
+    await engine.close();
+  });
+});
+
+describe('IndexedDbStorageEngine — queryResources: multiple pages', () => {
+  it('paginates correctly across two pages', async () => {
+    const engine = new IndexedDbStorageEngine(uniqueDbName());
+    const ids = ['p1', 'p2', 'p3', 'p4', 'p5'];
+    for (const id of ids) {
+      await engine.saveResource(makeResource(id, { state: ResourceState.HYDRATED }));
+    }
+
+    const page1 = await engine.queryResources({ state: ResourceState.HYDRATED, pageSize: 3 });
+    expect(page1.items).toHaveLength(3);
+    expect(page1.hasMore).toBe(true);
+    expect(page1.nextCursor).toBeDefined();
+
+    // page1.nextCursor is defined because hasMore is true (asserted above).
+    const page2 = await engine.queryResources({
+      state: ResourceState.HYDRATED,
+      pageSize: 3,
+      cursor: page1.nextCursor!,
+    });
+    expect(page2.items).toHaveLength(2);
+    expect(page2.hasMore).toBe(false);
+    expect(page2.nextCursor).toBeUndefined();
+
+    // All IDs covered, no duplicates.
+    const allIds = [...page1.items, ...page2.items].map((r) => r.id);
+    expect(allIds).toHaveLength(5);
+    expect(new Set(allIds).size).toBe(5);
+    await engine.close();
+  });
+
+  it('paginates across three pages with pageSize=2', async () => {
+    const engine = new IndexedDbStorageEngine(uniqueDbName());
+    for (let i = 0; i < 6; i++) {
+      await engine.saveResource(makeResource(`m${i}`, { state: ResourceState.HYDRATED }));
+    }
+
+    const pages: IResource[][] = [];
+    let cursor: string | undefined;
+    do {
+      const result = await engine.queryResources({
+        state: ResourceState.HYDRATED,
+        pageSize: 2,
+        ...(cursor !== undefined ? { cursor } : {}),
+      });
+      pages.push(result.items);
+      cursor = result.hasMore ? result.nextCursor : undefined;
+    } while (cursor !== undefined);
+
+    expect(pages).toHaveLength(3);
+    expect(pages.flat()).toHaveLength(6);
+    expect(new Set(pages.flat().map((r) => r.id)).size).toBe(6);
+    await engine.close();
+  });
+
+  it('full enumeration collects every matching resource', async () => {
+    const engine = new IndexedDbStorageEngine(uniqueDbName());
+    for (let i = 0; i < 25; i++) {
+      await engine.saveResource(
+        makeResource(`bulk_${String(i).padStart(3, '0')}`, { state: ResourceState.HYDRATED }),
+      );
+    }
+    // Mix in non-matching records.
+    for (let i = 0; i < 5; i++) {
+      await engine.saveResource(makeResource(`other_${i}`, { state: ResourceState.EXTRACTED }));
+    }
+
+    const all: IResource[] = [];
+    let cursor: string | undefined;
+    do {
+      const result = await engine.queryResources({
+        state: ResourceState.HYDRATED,
+        pageSize: 7,
+        ...(cursor !== undefined ? { cursor } : {}),
+      });
+      all.push(...result.items);
+      cursor = result.hasMore ? result.nextCursor : undefined;
+    } while (cursor !== undefined);
+
+    expect(all).toHaveLength(25);
+    expect(all.every((r) => r.state === ResourceState.HYDRATED)).toBe(true);
+    await engine.close();
+  });
+});
+
+describe('IndexedDbStorageEngine — queryResources: cursor continuation', () => {
+  it('cursor is stable across independent engine instances (simulating restart)', async () => {
+    const name = uniqueDbName();
+
+    const first = new IndexedDbStorageEngine(name);
+    for (let i = 0; i < 6; i++) {
+      await first.saveResource(
+        makeResource(`restart_${String(i).padStart(2, '0')}`, { state: ResourceState.HYDRATED }),
+      );
+    }
+    const page1 = await first.queryResources({ state: ResourceState.HYDRATED, pageSize: 3 });
+    await first.close();
+
+    // Simulate worker restart — fresh engine instance, same DB.
+    // nextCursor is defined: 6 items at pageSize 3 guarantees page 1 has hasMore=true.
+    const second = new IndexedDbStorageEngine(name);
+    const page2 = await second.queryResources({
+      state: ResourceState.HYDRATED,
+      pageSize: 3,
+      cursor: page1.nextCursor!,
+    });
+    await second.close();
+
+    const allIds = [...page1.items, ...page2.items].map((r) => r.id);
+    expect(allIds).toHaveLength(6);
+    expect(new Set(allIds).size).toBe(6);
+  });
+
+  it('invalid cursor (stale deleted resource) does not skip a live record', async () => {
+    const engine = new IndexedDbStorageEngine(uniqueDbName());
+    // Save resources with IDs that sort: 'c1' < 'c2' < 'c3' < 'c4'
+    for (const id of ['c1', 'c2', 'c3', 'c4']) {
+      await engine.saveResource(makeResource(id, { state: ResourceState.HYDRATED }));
+    }
+
+    // First page returns c1, c2.
+    const page1 = await engine.queryResources({ state: ResourceState.HYDRATED, pageSize: 2 });
+    expect(page1.items.map((r) => r.id)).toEqual(['c1', 'c2']);
+    expect(page1.nextCursor).toBe('c2');
+
+    // Delete c2 (the cursor record) before resuming.
+    await engine.deleteResource('c2');
+
+    // Second page should start from c3 (the first record after deleted c2).
+    // nextCursor is 'c2' (asserted above) so the non-null assertion is safe.
+    const page2 = await engine.queryResources({
+      state: ResourceState.HYDRATED,
+      pageSize: 2,
+      cursor: page1.nextCursor!,
+    });
+    expect(page2.items.map((r) => r.id)).toEqual(['c3', 'c4']);
+    expect(page2.hasMore).toBe(false);
+    await engine.close();
+  });
+
+  it('cursor from a completely out-of-range id returns empty', async () => {
+    const engine = new IndexedDbStorageEngine(uniqueDbName());
+    await engine.saveResource(makeResource('a1', { state: ResourceState.HYDRATED }));
+    await engine.saveResource(makeResource('a2', { state: ResourceState.HYDRATED }));
+
+    // A cursor that sorts after all existing IDs.
+    const result = await engine.queryResources({
+      state: ResourceState.HYDRATED,
+      pageSize: 10,
+      cursor: '￿￿',
+    });
+    expect(result.items).toHaveLength(0);
+    expect(result.hasMore).toBe(false);
+    await engine.close();
+  });
+});
+
+describe('IndexedDbStorageEngine — queryResources: ordering guarantees', () => {
+  it('returns items in lexicographic primary-key order within a state', async () => {
+    const engine = new IndexedDbStorageEngine(uniqueDbName());
+    // Insert in reverse order to confirm sort is storage-driven, not insertion-driven.
+    for (const id of ['z3', 'a1', 'm2', 'b0']) {
+      await engine.saveResource(makeResource(id, { state: ResourceState.HYDRATED }));
+    }
+
+    const result = await engine.queryResources({ state: ResourceState.HYDRATED, pageSize: 10 });
+    const ids = result.items.map((r) => r.id);
+    expect(ids).toEqual([...ids].sort());
+    await engine.close();
+  });
+
+  it('ordering is consistent across page boundaries', async () => {
+    const engine = new IndexedDbStorageEngine(uniqueDbName());
+    const source = ['z9', 'a1', 'm5', 'b2', 'k3', 'f8'];
+    for (const id of source) {
+      await engine.saveResource(makeResource(id, { state: ResourceState.HYDRATED }));
+    }
+
+    const all: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const result = await engine.queryResources({
+        state: ResourceState.HYDRATED,
+        pageSize: 2,
+        ...(cursor !== undefined ? { cursor } : {}),
+      });
+      all.push(...result.items.map((r) => r.id));
+      cursor = result.hasMore ? result.nextCursor : undefined;
+    } while (cursor !== undefined);
+
+    expect(all).toEqual([...source].sort());
     await engine.close();
   });
 });

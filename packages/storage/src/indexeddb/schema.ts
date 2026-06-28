@@ -10,7 +10,7 @@
 export const DB_NAME = 'knowledge-extractor';
 
 /** The current schema version. Bump this whenever a migration is added. */
-export const DB_VERSION = 1;
+export const DB_VERSION = 2;
 
 /**
  * Object store names. Each store is keyed by an in-record property (keyPath),
@@ -44,6 +44,13 @@ export const STORE_KEYPATHS: Record<StoreName, string> = {
 export const META_VERSION_KEY = 'schema_version';
 
 /**
+ * Name of the secondary index on `resources.state`, created in migration v2.
+ * Used by paginated enrichment queries to enumerate resources by lifecycle state
+ * without loading the entire store into memory.
+ */
+export const RESOURCE_STATE_INDEX = 'by_state';
+
+/**
  * A single schema migration. `apply` runs inside the native `onupgradeneeded`
  * transaction and may create/delete stores and indexes. It must be synchronous
  * (IndexedDB upgrade transactions cannot await microtasks).
@@ -71,6 +78,16 @@ export const MIGRATIONS: readonly IMigration[] = [
         if (!db.objectStoreNames.contains(store)) {
           db.createObjectStore(store, { keyPath: STORE_KEYPATHS[store] });
         }
+      }
+    },
+  },
+  {
+    version: 2,
+    description: 'Add by_state index on resources.state for bounded paginated enrichment queries',
+    apply(_db, transaction) {
+      const store = transaction.objectStore(STORES.RESOURCES);
+      if (!store.indexNames.contains(RESOURCE_STATE_INDEX)) {
+        store.createIndex(RESOURCE_STATE_INDEX, 'state', { unique: false });
       }
     },
   },
