@@ -15,7 +15,8 @@
     "@knowledge-extractor/storage": "workspace:*",
     "@knowledge-extractor/types": "workspace:*",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "tesseract.js": "^7.0.0"
   },
   "devDependencies": {
     "@crxjs/vite-plugin": "^2.0.0-beta.23",

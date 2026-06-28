@@ -19,6 +19,7 @@ import {
 } from '@knowledge-extractor/types';
 import { CrawlController } from './crawl-controller.js';
 import { EnrichmentLoop } from './enrichment-loop.js';
+import { OcrEngine } from './ocr-engine.js';
 import { MediaCaptureCoordinator, type ICaptureTransport } from './media-capture.js';
 import { InstagramConnector } from '@knowledge-extractor/connector-instagram';
 import {
@@ -130,9 +131,18 @@ const controller = new CrawlController(
   mediaCapture,
 );
 
-// Enrichment loop: only available when IndexedDB is present (idbEngine implements
-// IResourceQueryable). Falls back to null — no enumeration in volatile mode.
-const enrichmentLoop = idbEngine !== null ? new EnrichmentLoop(idbEngine, mediaStore) : null;
+// OCR engine and enrichment loop: only available when IndexedDB is present.
+// OcrEngine manages the offscreen document lifecycle; EnrichmentLoop calls its
+// process() method as the onWorkItem handler.
+const ocrEngine = idbEngine !== null ? new OcrEngine(idbEngine, mediaStore) : null;
+const enrichmentLoop =
+  idbEngine !== null
+    ? new EnrichmentLoop(
+        idbEngine,
+        mediaStore,
+        ocrEngine !== null ? ocrEngine.process.bind(ocrEngine) : undefined,
+      )
+    : null;
 
 /** Requests durable (non-evictable) storage. Best-effort; safe if unsupported. */
 async function requestPersistence(): Promise<void> {
@@ -206,7 +216,10 @@ async function startup(): Promise<void> {
       if (enrichmentLoop !== null) {
         enrichmentLoop
           .runPass()
-          .then((report) => logger.info('Enrichment pass complete', report))
+          .then((report) => {
+            logger.info('Enrichment pass complete', report);
+            return ocrEngine?.terminate();
+          })
           .catch((err) => logger.error('Enrichment pass unexpectedly threw', err));
       }
     });
