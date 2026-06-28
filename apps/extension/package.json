@@ -6,13 +6,14 @@
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src"
+    "lint": "eslint src tests",
+    "test": "vitest run"
   },
   "dependencies": {
-    "@knowledge-extractor/types": "workspace:*",
+    "@knowledge-extractor/connector-instagram": "workspace:*",
     "@knowledge-extractor/shared": "workspace:*",
     "@knowledge-extractor/storage": "workspace:*",
-    "@knowledge-extractor/connector-instagram": "workspace:*",
+    "@knowledge-extractor/types": "workspace:*",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
@@ -22,6 +23,7 @@
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
-    "vite": "^5.3.1"
+    "vite": "^5.3.1",
+    "vitest": "^2.1.9"
   }
 }

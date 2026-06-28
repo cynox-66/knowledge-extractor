@@ -7,6 +7,20 @@ import {
 import { Logger } from './logger.js';
 
 /**
+ * Serializable snapshot of the collector's state, used by the runtime layer to
+ * persist diagnostics across service-worker eviction / browser restart. Kept
+ * here (not chrome-coupled) so `shared` stays platform-agnostic — the background
+ * worker performs the actual persistence.
+ */
+export interface IDiagnosticsState {
+  sessionId: string;
+  startedAt: string;
+  pageUrl: string;
+  failures: IFailureRecord[];
+  strategyUsage: Record<string, number>;
+}
+
+/**
  * Accumulates all diagnostic data for a single extraction session.
  * Lives in the Background Worker and is reset on each pipeline start.
  */
@@ -79,5 +93,25 @@ export class DiagnosticsCollector {
 
   getFailures(): IFailureRecord[] {
     return [...this.failures];
+  }
+
+  /** Serializes the current state for durable persistence. */
+  snapshot(): IDiagnosticsState {
+    return {
+      sessionId: this.sessionId,
+      startedAt: this.startedAt,
+      pageUrl: this.pageUrl,
+      failures: [...this.failures],
+      strategyUsage: { ...this.strategyUsage },
+    };
+  }
+
+  /** Restores state from a persisted snapshot (after worker restart). */
+  hydrate(state: IDiagnosticsState): void {
+    this.sessionId = state.sessionId;
+    this.startedAt = state.startedAt;
+    this.pageUrl = state.pageUrl;
+    this.failures = [...state.failures];
+    this.strategyUsage = { ...state.strategyUsage };
   }
 }

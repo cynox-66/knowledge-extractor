@@ -5,3 +5,4 @@ lib/
 coverage/
 .claude/
 pnpm-lock.yaml
+research_docs/

@@ -61,7 +61,8 @@ period). Resumes from persisted state on worker restart.
 Owns the `Map<string, ICrawlTask>` queue. Handles enqueue (with dedup),
 priority, task state transitions, and exponential-backoff retry
 (`baseBackoffMs * 2^(attempts-1)`, via `nextRetryAt`). `snapshot()` / `restore()`
-persist the full queue to `chrome.storage.session`.
+persist the full queue to IndexedDB via `IControlStateStore` (durable across
+browser restart); on restore, in-flight tasks reset to `QUEUED`.
 
 ### Navigator (`apps/extension/src/content/navigator.ts`)
 
@@ -92,9 +93,10 @@ first applicable result tagged with `{ data, strategyName }`. Current chain:
 
 ### SessionManager (`apps/extension/src/background/session-manager.ts`)
 
-Single source of truth for crawl state. Persists `ICrawlSession` to
-`chrome.storage.session`. Embeds a `MetricsCollector` snapshot on every persist
-so counters are never duplicated. Rehydrates metrics on worker restart.
+Single source of truth for crawl state. Persists `ICrawlSession` via
+`IControlStateStore` (IndexedDB-backed, durable across browser restart). Embeds
+a `MetricsCollector` snapshot on every persist so counters are never duplicated.
+Rehydrates metrics on worker restart.
 
 ### MetricsCollector (`packages/shared/src/metrics-collector.ts`)
 
@@ -106,12 +108,34 @@ Supports `hydrate()` for restoring state after restart.
 
 Records per-failure data (category, target URI, message, DOM snapshot, failing
 strategy) and per-extraction strategy usage. Produces `ISessionReport` via
-`buildReport(metrics)`.
+`buildReport(metrics)`. `snapshot()`/`hydrate()` let the background worker
+persist diagnostics through `IControlStateStore` (IndexedDB) without coupling
+`shared` to a specific storage substrate.
 
-### InMemoryStorage (`packages/storage/src/memory-storage.ts`)
+### Storage (`packages/storage`)
 
-Implements `IStorageEngine` with a `Map<string, IResource>`. Transactional
-interface (`ITransaction`) for future durable backends (IndexedDB).
+The runtime uses `IndexedDbStorageEngine` (durable resources) by default,
+degrading to `InMemoryStorage` only where IndexedDB is unavailable. Both
+implement the frozen `IStorageEngine`; `CrawlController` depends on the
+interface, never the concrete class. See [STORAGE.md](STORAGE.md).
+
+### MediaStore (`packages/storage/src/media`)
+
+Durable binary media persistence (`IMediaStore`), owned by the composition root
+and injected into `CrawlController`. As of Beta-1, consumed by the
+`MediaCaptureCoordinator`: media bytes captured during a crawl are persisted to
+OPFS via this contract, and the resulting `IMediaMetadata.storagePath` is
+stamped onto `IMedia.localUri`.
+
+### MediaCaptureCoordinator (`apps/extension/src/background/media-capture.ts`)
+
+Drives media hydration for one resource. Pipeline position: after normalization,
+before resource persistence. Asks the content script (the only context with the
+authenticated Instagram session) to fetch each `IMedia.sourceUri`, persists the
+bytes via `IMediaStore`, stamps `localUri`, and promotes `ResourceState` to
+`HYDRATED` when every present media item has landed. Carousel children
+(`IResource.children`) are hydrated recursively. Skips `MediaType.VIDEO` and
+inline `data:`/`blob:` URIs (out-of-scope for Beta-1). Idempotent on retry.
 
 ### Popup (`apps/extension/src/popup/index.tsx`)
 
@@ -119,6 +143,69 @@ Stateless monitoring dashboard. Hydrates from `GET_SESSION` on open. Renders
 metrics from the canonical `ICrawlSession.metrics` snapshot. Controls:
 Start / Pause / Resume / Cancel / Export Diagnostics. Closing the popup never
 stops the crawl.
+
+## Runtime composition & lifecycle
+
+### Composition root
+
+`apps/extension/src/background/index.ts` is the **only** place that constructs
+infrastructure. It builds `MetricsCollector`, `DiagnosticsCollector`,
+`InstagramConnector`, the `IStorageEngine` and `IControlStateStore` (one
+`IndexedDbStorageEngine` instance implementing both, with volatile fallbacks if
+IndexedDB is unavailable), and the `IMediaStore` (`OpfsBlobBackend`, or
+`InMemoryBlobBackend` if OPFS is unavailable), then injects them into
+`CrawlController`. Subsystems never construct infrastructure themselves.
+
+### Startup lifecycle
+
+```
+SW starts → index.ts (sync):
+  1. construct infrastructure (lazy: no I/O yet)
+  2. construct CrawlController(metrics, diagnostics, connector, storage, mediaStore)
+  3. register chrome.alarms + chrome.runtime listeners  ← synchronous, before any await
+  4. kick off async startup():
+       requestPersistence()             navigator.storage.persist() (best-effort)
+       migrateLegacyControlState()      one-shot lift of Phase-3 keys → IndexedDB
+       probe storage                    surface a diagnostic if durable storage is broken
+       controller.init()                recover session + queue + diagnostics, resume if active
+```
+
+Listeners are registered synchronously (before the first `await`) so a revived
+worker never misses an event.
+
+### Persistence lifecycle
+
+| Data                       | Store                            | Survives SW eviction | Survives browser restart |
+| -------------------------- | -------------------------------- | -------------------- | ------------------------ |
+| Resources (`IResource`)    | IndexedDB (`IStorageEngine`)     | ✅                   | ✅                       |
+| Media blobs                | OPFS (`IMediaStore`)             | ✅                   | ✅                       |
+| Session + embedded metrics | IndexedDB (`IControlStateStore`) | ✅                   | ✅                       |
+| Scheduler queue            | IndexedDB (`IControlStateStore`) | ✅                   | ✅                       |
+| Diagnostics snapshot       | IndexedDB (`IControlStateStore`) | ✅                   | ✅                       |
+
+> Beta-0 Phase 3.5 unified persistence: all durable state lives in IndexedDB
+> (resources via `IStorageEngine`, control state via `IControlStateStore`) or
+> OPFS (media blobs via `IMediaStore`). One substrate, one migration regime, one
+> transactional context. `chrome.storage.local` is reserved for future user
+> preferences and feature flags. The composition root runs a one-shot migration
+> at startup to lift any legacy Phase-3 keys out of `chrome.storage.local`.
+
+### Recovery lifecycle
+
+On every worker startup `CrawlController.init()` reconnects to the durable
+stores and restores state: `SessionManager.init()` (session + metric rehydrate),
+`hydrateScheduler()` (queue; in-flight tasks reset to `QUEUED`),
+`hydrateDiagnostics()`. If the persisted session was `isRunning && !isPaused`,
+the crawl resumes automatically. The IndexedDB connection and `MediaStore`
+reattach lazily on first use.
+
+**Persistence is the success gate.** In `processNext`, a resource is persisted
+(`saveResource` → `commit`) **before** `scheduler.markCompleted`. A persistence
+failure throws, is caught, and routes to `handleTaskFailure` — the task is left
+non-completed and retried, and a diagnostic is recorded. Combined with
+deterministic resource ids (`ig_<externalId>`) and idempotent `saveResource`,
+this guarantees no duplicate resources and no work marked complete without
+durable persistence.
 
 ## Message flow
 

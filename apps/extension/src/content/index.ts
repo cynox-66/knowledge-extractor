@@ -70,6 +70,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message.action === 'CAPTURE_MEDIA') {
+    const items = (message.data?.mediaItems ?? []) as Array<{
+      id: string;
+      sourceUri: string;
+      mimeType?: string;
+    }>;
+    captureMedia(items)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: String(err) }));
+    return true;
+  }
+
   return false;
 });
 
@@ -155,4 +167,61 @@ function safePathname(uri: string): string {
   } catch {
     return '';
   }
+}
+
+// ---- Media capture (Beta-1) ------------------------------------------------
+//
+// Owned by the page-origin content script because only it can fetch
+// Instagram's CDN with the live authenticated session cookies. Service-worker
+// fetches against `scontent.cdninstagram.com` are 403 or CORS-blocked. Bytes
+// are returned to the background as transferable `ArrayBuffer`s.
+
+interface CaptureRequest {
+  id: string;
+  sourceUri: string;
+  mimeType?: string;
+}
+
+interface CaptureResult {
+  success: true;
+  captured: Array<{
+    id: string;
+    bytes: ArrayBuffer;
+    mimeType: string;
+    sizeBytes: number;
+    source: string;
+  }>;
+  failed: Array<{ id: string; error: string }>;
+}
+
+async function captureMedia(items: CaptureRequest[]): Promise<CaptureResult> {
+  const captured: CaptureResult['captured'] = [];
+  const failed: CaptureResult['failed'] = [];
+
+  // Sequential fetches to avoid spiking the network and to keep memory bounded.
+  // Per-item failures never abort the batch.
+  for (const item of items) {
+    try {
+      const response = await fetch(item.sourceUri, { credentials: 'include' });
+      if (!response.ok) {
+        failed.push({ id: item.id, error: `HTTP ${response.status}` });
+        continue;
+      }
+      const buffer = await response.arrayBuffer();
+      const mimeType =
+        response.headers.get('content-type') ?? item.mimeType ?? 'application/octet-stream';
+      captured.push({
+        id: item.id,
+        bytes: buffer,
+        mimeType,
+        sizeBytes: buffer.byteLength,
+        source: item.sourceUri,
+      });
+    } catch (err) {
+      failed.push({ id: item.id, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  logger.info(`captureMedia: captured=${captured.length} failed=${failed.length}`);
+  return { success: true, captured, failed };
 }

@@ -1,18 +1,26 @@
-import { Logger, MetricsCollector, DiagnosticsCollector } from '@knowledge-extractor/shared';
+import {
+  Logger,
+  MetricsCollector,
+  DiagnosticsCollector,
+  IDiagnosticsState,
+} from '@knowledge-extractor/shared';
 import {
   IDiscoveredResource,
   ICrawlSession,
   ISessionReport,
   FailureCategory,
   ICrawlTask,
+  IStorageEngine,
+  IControlStateStore,
+  IMediaStore,
 } from '@knowledge-extractor/types';
 import { InstagramConnector } from '@knowledge-extractor/connector-instagram';
-import { InMemoryStorage } from '@knowledge-extractor/storage';
 import { SessionManager } from './session-manager.js';
 import { Scheduler } from './scheduler.js';
+import { MediaCaptureCoordinator } from './media-capture.js';
 
 /** Pipeline stage, used to categorize failures without bespoke error classes. */
-type Stage = 'navigation' | 'extraction' | 'normalization';
+type Stage = 'navigation' | 'extraction' | 'normalization' | 'capture';
 
 /** The shape the content script returns from EXTRACT_RESOURCE. */
 interface ExtractResponse {
@@ -35,12 +43,16 @@ interface ExtractResponse {
  *    while a crawl is active (no perpetual `setInterval`).
  *  - A `chrome.alarms` watchdog wakes the worker after suspension and resumes
  *    the loop from persisted state.
- *  - Scheduler queue and session are persisted to `chrome.storage.session`
- *    after every state transition, so no work is lost or duplicated.
+ *  - Scheduler queue, session, and diagnostics are persisted to the durable
+ *    `IControlStateStore` (IndexedDB) after every state transition, so no work
+ *    is lost or duplicated. Normalized resources are persisted to the durable
+ *    `IStorageEngine`. Sharing a substrate enables cross-store atomicity in a
+ *    single transaction.
  */
 export class CrawlController {
   static readonly ALARM_NAME = 'ke-crawl-tick';
   private static readonly SCHED_KEY = 'crawl_scheduler';
+  private static readonly DIAG_KEY = 'crawl_diagnostics';
   private static readonly TICK_MS = 800;
   private static readonly MAX_EMPTY_SCROLLS = 3;
 
@@ -51,7 +63,12 @@ export class CrawlController {
   private readonly metrics: MetricsCollector;
   private readonly diagnostics: DiagnosticsCollector;
   private readonly connector: InstagramConnector;
-  private readonly storage: InMemoryStorage;
+  private readonly storage: IStorageEngine;
+  private readonly controlStore: IControlStateStore;
+  /** Durable media store; consumed by `mediaCapture` (Beta-1). */
+  private readonly mediaStore: IMediaStore;
+  /** Captures media bytes between normalization and resource persistence. */
+  private readonly mediaCapture: MediaCaptureCoordinator;
 
   private loopTimer: ReturnType<typeof setTimeout> | null = null;
   private isProcessing = false;
@@ -61,13 +78,19 @@ export class CrawlController {
     metrics: MetricsCollector,
     diagnostics: DiagnosticsCollector,
     connector: InstagramConnector,
-    storage: InMemoryStorage,
+    storage: IStorageEngine,
+    controlStore: IControlStateStore,
+    mediaStore: IMediaStore,
+    mediaCapture: MediaCaptureCoordinator,
   ) {
     this.metrics = metrics;
     this.diagnostics = diagnostics;
     this.connector = connector;
     this.storage = storage;
-    this.sessionManager = new SessionManager(metrics);
+    this.controlStore = controlStore;
+    this.mediaStore = mediaStore;
+    this.mediaCapture = mediaCapture;
+    this.sessionManager = new SessionManager(metrics, controlStore);
   }
 
   // ---- Lifecycle ------------------------------------------------------------
@@ -79,6 +102,7 @@ export class CrawlController {
   async init(): Promise<void> {
     await this.sessionManager.init();
     await this.hydrateScheduler();
+    await this.hydrateDiagnostics();
 
     const session = this.sessionManager.getSession();
     if (session?.isRunning && !session.isPaused) {
@@ -97,6 +121,7 @@ export class CrawlController {
 
     const pageUrl = await this.activeTabUrl();
     this.diagnostics.reset(pageUrl);
+    await this.persistDiagnostics();
 
     await this.ensureAlarm();
     this.broadcastEvent('CRAWL_STARTED', { sessionId: session.sessionId });
@@ -140,6 +165,7 @@ export class CrawlController {
     await this.sessionManager.update({ isRunning: false, navigationStatus: `finished:${reason}` });
     this.stopLoop();
     await this.clearAlarm();
+    await this.persistDiagnostics();
     this.broadcastEvent('CRAWL_FINISHED', { sessionId: session?.sessionId ?? '', reason });
     this.logger.info(`Crawl finished: ${reason}`);
   }
@@ -282,6 +308,34 @@ export class CrawlController {
       this.metrics.recordNormalized(performance.now() - normStart);
       this.broadcastEvent('RESOURCE_NORMALIZED', { resourceId: normalized.id });
 
+      // --- Capture ---
+      // Hydrate media bytes from the authenticated tab into the MediaStore
+      // BEFORE persisting the resource, so the on-disk record reflects the
+      // bytes actually captured (`localUri`, `state=HYDRATED` when complete).
+      stage = 'capture';
+      await this.sessionManager.update({ navigationStatus: 'capturing' });
+      const captureOutcome = await this.mediaCapture.hydrate(normalized);
+      for (const failure of captureOutcome.failures) {
+        this.diagnostics.recordFailure(
+          failure.sourceUri,
+          'selector_failure',
+          `Media capture failed: ${failure.reason}`,
+          { failingStrategy: 'capture' },
+        );
+      }
+      // If we attempted to fetch media but landed nothing, treat the whole
+      // task as a capture failure — retry path handles transient errors.
+      const attemptedCapture = captureOutcome.persisted + captureOutcome.failures.length > 0;
+      if (attemptedCapture && captureOutcome.persisted === 0) {
+        throw new Error(`Media capture failed for all ${captureOutcome.failures.length} item(s)`);
+      }
+      this.broadcastEvent('RESOURCE_HYDRATED', {
+        resourceId: normalized.id,
+        persisted: captureOutcome.persisted,
+        failed: captureOutcome.failures.length,
+        skipped: captureOutcome.skipped,
+      });
+
       // --- Persistence ---
       const tx = await this.storage.beginTransaction();
       await this.storage.saveResource(normalized, tx);
@@ -301,6 +355,7 @@ export class CrawlController {
       this.isProcessing = false;
       this.metrics.observeQueueDepth(this.scheduler.getQueueDepth());
       await this.persistScheduler();
+      await this.persistDiagnostics();
       await this.sessionManager.update({ currentResource: '', navigationStatus: 'idle' });
       await this.sessionManager.sync(this.scheduler.getQueueDepth());
     }
@@ -311,7 +366,9 @@ export class CrawlController {
     const message = err instanceof Error ? err.message : String(err);
     const domSnapshot = err instanceof ExtractFailure ? err.domSnapshot : undefined;
 
-    // Stage-specific failure counters.
+    // Stage-specific failure counters. Capture failures share the
+    // post-extraction failure counter (the metric set is frozen at Layer 0;
+    // the per-stage label flows through the diagnostic record).
     if (stage === 'navigation') this.metrics.recordNavigationFailure();
     else if (stage === 'extraction') this.metrics.recordExtractionFailure();
     else this.metrics.recordNormalizationFailure();
@@ -343,6 +400,7 @@ export class CrawlController {
   private categoryFor(stage: Stage): FailureCategory {
     if (stage === 'navigation') return 'selector_failure';
     if (stage === 'extraction') return 'parsing_failure';
+    if (stage === 'capture') return 'network_error';
     return 'normalization_failure';
   }
 
@@ -378,17 +436,27 @@ export class CrawlController {
   // ---- Persistence helpers --------------------------------------------------
 
   private async persistScheduler(): Promise<void> {
-    await chrome.storage.session.set({
-      [CrawlController.SCHED_KEY]: this.scheduler.snapshot(),
-    });
+    await this.controlStore.saveCrawlState(CrawlController.SCHED_KEY, this.scheduler.snapshot());
   }
 
   private async hydrateScheduler(): Promise<void> {
-    const data = await chrome.storage.session.get(CrawlController.SCHED_KEY);
-    const tasks = data[CrawlController.SCHED_KEY] as ICrawlTask[] | undefined;
+    const tasks = await this.controlStore.getCrawlState<ICrawlTask[]>(CrawlController.SCHED_KEY);
     if (tasks && tasks.length > 0) {
       this.scheduler.restore(tasks);
       this.metrics.observeQueueDepth(this.scheduler.getQueueDepth());
+    }
+  }
+
+  private async persistDiagnostics(): Promise<void> {
+    await this.controlStore.saveCrawlState(CrawlController.DIAG_KEY, this.diagnostics.snapshot());
+  }
+
+  private async hydrateDiagnostics(): Promise<void> {
+    const state = await this.controlStore.getCrawlState<IDiagnosticsState>(
+      CrawlController.DIAG_KEY,
+    );
+    if (state) {
+      this.diagnostics.hydrate(state);
     }
   }
 
@@ -400,6 +468,14 @@ export class CrawlController {
 
   exportDiagnostics(): ISessionReport {
     return this.diagnostics.buildReport(this.metrics.snapshot());
+  }
+
+  /**
+   * Exposes the durable media store for later phases (e.g. the Beta-1 media
+   * capture / OCR pipeline). Not consumed in Beta-0.
+   */
+  getMediaStore(): IMediaStore {
+    return this.mediaStore;
   }
 
   // ---- Chrome glue ----------------------------------------------------------
