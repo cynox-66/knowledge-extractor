@@ -1,6 +1,7 @@
 import {
   IResourceQueryable,
   IMediaStore,
+  IControlStateStore,
   IEnrichmentWorkItem,
   IReconciliationReport,
   ResourceState,
@@ -45,6 +46,7 @@ export class EnrichmentLoop {
     private readonly queryable: IResourceQueryable,
     private readonly mediaStore: IMediaStore,
     private readonly onWorkItem: (item: IEnrichmentWorkItem) => Promise<void> = async () => {},
+    private readonly controlStateStore?: IControlStateStore,
   ) {}
 
   /**
@@ -65,7 +67,10 @@ export class EnrichmentLoop {
     let errorMessage: string | undefined;
 
     try {
-      let cursor: string | undefined;
+      // Recover cursor from durable state so the pass resumes after an MV3
+      // service worker eviction rather than restarting from the beginning.
+      let cursor: string | undefined =
+        (await this.controlStateStore?.getCrawlState<string>('enrichment_cursor')) ?? undefined;
 
       do {
         const page = await this.queryable.queryResources({
@@ -116,6 +121,14 @@ export class EnrichmentLoop {
           }
         }
 
+        // Checkpoint once per page — after all items in the page have been
+        // attempted — so an evicted service worker resumes from the next page
+        // rather than re-processing the current one.
+        const lastPageItemId = page.items.at(-1)?.id;
+        if (lastPageItemId !== undefined && this.controlStateStore !== undefined) {
+          await this.controlStateStore.saveCrawlState('enrichment_cursor', lastPageItemId);
+        }
+
         cursor = page.hasMore ? page.nextCursor : undefined;
 
         // Yield between pages — never on the final page.
@@ -123,6 +136,9 @@ export class EnrichmentLoop {
           await yieldToEventLoop();
         }
       } while (cursor !== undefined);
+
+      // Clear the checkpoint: the pass completed without eviction.
+      await this.controlStateStore?.deleteCrawlState('enrichment_cursor');
 
       completedCleanly = true;
     } catch (err) {

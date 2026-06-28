@@ -4,41 +4,34 @@
 Beta-2 (OCR Engine)
 
 ## Current Objective
-Phase 4B — Enrichment Cursor Checkpointing. Persist the `enrichment_cursor` to durable storage so the OCR enrichment pass can resume from the last successfully processed resource after an MV3 service worker eviction, rather than restarting from the beginning.
+Phase 4C — Self-rescheduling. Automatically schedule the next OCR enrichment pass after a successful run using `chrome.alarms`.
 
 ## Why this task exists
-With Phase 4A complete, `EnrichmentLoop` now performs multi-minute OCR processing via the `chrome.offscreen` document. Because MV3 background service workers are routinely evicted by the browser (e.g., after 30 seconds of idleness), a long OCR pass is almost guaranteed to be interrupted. Without checkpointing, the pass will infinitely restart on every activation and never complete.
+Currently, `EnrichmentLoop` only runs once on service worker startup. Since the OCR enrichment process is a background daemon task, it should proactively wake up and process newly hydrated resources on a regular interval without requiring the user to restart the extension.
 
 ## Pre-conditions (must be verified at session start)
-1. **Phase 4A is complete.** The OCR engine is actively running and processing resources inside the `onWorkItem` callback.
-2. **`IControlStateStore` is available.** The store must support writing arbitrary key-value crawl state via `saveCrawlState()`.
+1. **Phase 4B is complete.** The enrichment loop correctly checkpoints its cursor and survives evictions.
+2. **MV3 Restrictions.** `setInterval` cannot be used in background service workers. All periodic scheduling must use `chrome.alarms`.
 
 ## Scope
 
-### Phase 4B — Enrichment Cursor Checkpointing
-- **Persist Cursor:** After successfully processing a page of resources in `EnrichmentLoop.runPass()`, persist the last successfully processed cursor (resource id) to `IControlStateStore.saveCrawlState('enrichment_cursor', lastId)`.
-- **Load Cursor:** On the next service worker activation, load the cursor with `getCrawlState<string>('enrichment_cursor')` and pass it as the initial cursor (i.e. `continuePrimaryKey`) to `queryResources()`.
-- **Clear Cursor:** Clear the checkpoint (`deleteCrawlState('enrichment_cursor')`) when `runPass()` completes cleanly (`completedCleanly: true`).
+### Phase 4C — Self-rescheduling
+- **Schedule Next Pass:** After a clean pass (`completedCleanly: true`), schedule the next pass using `chrome.alarms.create()` with a configurable interval (default: 5 minutes).
+- **Alarm Listener:** Listen for this specific alarm in `apps/extension/src/background/index.ts` and invoke `runPass()`.
+- **Concurrency Control:** Ensure that if an alarm fires while an enrichment pass is already active, the new pass is skipped or queued to avoid overlapping executions.
 
 ## Constraints
-- **Performance:** Do not write to IndexedDB on every single resource. Batch the checkpoint update to run once per page loop iteration.
-- **No modification to `IStorageEngine` interface:** Use the existing `IControlStateStore` API.
+- **Do not use `setInterval`.** It is unsafe in Manifest V3 service workers.
+- **Centralized Event Listeners.** All `chrome.alarms.onAlarm.addListener` registrations must happen synchronously at the top level of `index.ts`.
 
 ## Files Expected to Change
-- `apps/extension/src/background/enrichment-loop.ts` (Implement checkpointing logic)
-- `apps/extension/tests/enrichment-loop.test.ts` (Add tests for cursor persistence and recovery)
+- `apps/extension/src/background/index.ts` (Add alarm creation and listener)
 
 ## Risks
-- **Data Race on Eviction:** Ensure the cursor is committed to the control state store before the page loop yields to the event loop, minimizing the window where a service worker eviction could lose track of processed items.
-- **Infinite Loops:** Ensure the cursor logic does not cause `queryResources` to repeatedly fetch the same page if an error occurs.
-
-## Testing Requirements
-- Unit tests for `EnrichmentLoop` must verify that the cursor is correctly saved to `IControlStateStore` during a pass.
-- Unit tests must verify that `EnrichmentLoop` initializes `queryResources` with the recovered cursor upon startup.
-- Unit tests must verify the cursor is cleared after a successful full pass.
+- **Overlapping Executions:** The primary risk is a new alarm firing while a long OCR pass is still in progress (despite the 5-minute interval). A simple boolean lock or state check must prevent concurrent `runPass()` executions.
 
 ## Exit Criteria
-- The last processed resource ID is checkpointed after each page.
-- `EnrichmentLoop` correctly resumes from the persisted cursor on the next worker activation.
-- The cursor is cleared upon full completion of the pass.
+- After a successful pass, an alarm is created.
+- When the alarm fires, `runPass()` is executed.
+- Overlapping executions are prevented.
 - Gate suite passes: typecheck, lint, tests, dependency-cruiser, build.

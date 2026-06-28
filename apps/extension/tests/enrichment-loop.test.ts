@@ -8,6 +8,7 @@ import {
   IMediaMetadata,
   IMediaStoreStatistics,
   ICleanupResult,
+  IControlStateStore,
   IEnrichmentWorkItem,
   ResourceState,
   MediaType,
@@ -477,5 +478,195 @@ describe('EnrichmentLoop — onWorkItem ordering', () => {
     await loop.runPass();
 
     expect(delivered).toEqual(ids);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stub IControlStateStore
+// ---------------------------------------------------------------------------
+
+class StubControlStateStore implements IControlStateStore {
+  private readonly state = new Map<string, unknown>();
+
+  async saveCrawlState(key: string, value: unknown): Promise<void> {
+    this.state.set(key, value);
+  }
+  async getCrawlState<T = unknown>(key: string): Promise<T | null> {
+    return (this.state.get(key) as T) ?? null;
+  }
+  async deleteCrawlState(key: string): Promise<void> {
+    this.state.delete(key);
+  }
+
+  // Unused session/diagnostics methods — required by interface.
+  saveSession(): Promise<void> {
+    return Promise.resolve();
+  }
+  getSession(): Promise<null> {
+    return Promise.resolve(null);
+  }
+  listSessions(): Promise<[]> {
+    return Promise.resolve([]);
+  }
+  saveDiagnostics(): Promise<void> {
+    return Promise.resolve();
+  }
+  getDiagnostics(): Promise<null> {
+    return Promise.resolve(null);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Checkpointing suites
+// ---------------------------------------------------------------------------
+
+describe('EnrichmentLoop — cursor checkpointing: saved after each page', () => {
+  it('saves the cursor after each page during a multi-page pass', async () => {
+    // PAGE_SIZE is 20; create 45 resources to force 3 pages (20+20+5).
+    const resources = Array.from({ length: 45 }, (_, i) =>
+      makeResource(`r${String(i).padStart(3, '0')}`, { mediaIds: [] }),
+    );
+    const store = new StubControlStateStore();
+    const saveSpy = vi.spyOn(store, 'saveCrawlState');
+
+    const loop = new EnrichmentLoop(
+      new InMemoryQueryable(resources),
+      new StubMediaStore(),
+      async () => {},
+      store,
+    );
+    await loop.runPass();
+
+    // saveCrawlState must have been called once per page (3 pages).
+    expect(saveSpy).toHaveBeenCalledTimes(3);
+    // First call: last item of page 1 (index 19).
+    expect(saveSpy).toHaveBeenNthCalledWith(1, 'enrichment_cursor', 'r019');
+    // Second call: last item of page 2 (index 39).
+    expect(saveSpy).toHaveBeenNthCalledWith(2, 'enrichment_cursor', 'r039');
+    // Third call: last item of page 3 (index 44).
+    expect(saveSpy).toHaveBeenNthCalledWith(3, 'enrichment_cursor', 'r044');
+  });
+
+  it('saves the cursor even when all items on a page are skipped', async () => {
+    const resources = [
+      makeResource('s1', { mediaComplete: false }),
+      makeResource('s2', { mediaComplete: false }),
+    ];
+    const store = new StubControlStateStore();
+    const saveSpy = vi.spyOn(store, 'saveCrawlState');
+
+    const loop = new EnrichmentLoop(
+      new InMemoryQueryable(resources),
+      new StubMediaStore(),
+      async () => {},
+      store,
+    );
+    await loop.runPass();
+
+    // One page; cursor should be saved to the last item in that page.
+    expect(saveSpy).toHaveBeenCalledWith('enrichment_cursor', 's2');
+  });
+
+  it('does not call saveCrawlState when no controlStateStore is provided', async () => {
+    // Existing call-sites omit the store; this verifies backward-compat.
+    const resources = [makeResource('r1', { mediaIds: [] })];
+    // No store passed — must not throw.
+    const loop = new EnrichmentLoop(new InMemoryQueryable(resources), new StubMediaStore());
+    const report = await loop.runPass();
+    expect(report.completedCleanly).toBe(true);
+  });
+});
+
+describe('EnrichmentLoop — cursor checkpointing: restored on startup', () => {
+  it('passes the recovered cursor to queryResources on the first call', async () => {
+    const resources = Array.from({ length: 5 }, (_, i) => makeResource(`r${i}`, { mediaIds: [] }));
+    const store = new StubControlStateStore();
+    // Pre-seed cursor pointing to r1, so the loop should start from r2.
+    await store.saveCrawlState('enrichment_cursor', 'r1');
+
+    const queryable = new InMemoryQueryable(resources);
+    const qSpy = vi.spyOn(queryable, 'queryResources');
+
+    const loop = new EnrichmentLoop(queryable, new StubMediaStore(), async () => {}, store);
+    await loop.runPass();
+
+    // First queryResources call must include cursor='r1'.
+    expect(qSpy).toHaveBeenCalledWith(expect.objectContaining({ cursor: 'r1' }));
+  });
+
+  it('resumes enumeration from the persisted cursor position', async () => {
+    const resources = Array.from({ length: 5 }, (_, i) => makeResource(`r${i}`, { mediaIds: [] }));
+    const store = new StubControlStateStore();
+    // Simulate eviction after processing r0 and r1 (cursor = 'r1').
+    await store.saveCrawlState('enrichment_cursor', 'r1');
+
+    const delivered: string[] = [];
+    const loop = new EnrichmentLoop(
+      new InMemoryQueryable(resources),
+      new StubMediaStore(),
+      async (item) => {
+        delivered.push(item.resource.id);
+      },
+      store,
+    );
+    await loop.runPass();
+
+    // Should start from r2 (the item after r1), not from r0.
+    expect(delivered).toEqual(['r2', 'r3', 'r4']);
+    expect(delivered).not.toContain('r0');
+    expect(delivered).not.toContain('r1');
+  });
+});
+
+describe('EnrichmentLoop — cursor checkpointing: cleared after completion', () => {
+  it('deletes the enrichment_cursor after a successful full pass', async () => {
+    const resources = [makeResource('r1', { mediaIds: [] })];
+    const store = new StubControlStateStore();
+    const deleteSpy = vi.spyOn(store, 'deleteCrawlState');
+
+    const loop = new EnrichmentLoop(
+      new InMemoryQueryable(resources),
+      new StubMediaStore(),
+      async () => {},
+      store,
+    );
+    const report = await loop.runPass();
+
+    expect(report.completedCleanly).toBe(true);
+    expect(deleteSpy).toHaveBeenCalledWith('enrichment_cursor');
+  });
+
+  it('cursor is absent in the store after a successful pass', async () => {
+    const resources = [makeResource('r1', { mediaIds: [] })];
+    const store = new StubControlStateStore();
+    // Pre-seed a cursor that would normally be there from a prior partial pass.
+    await store.saveCrawlState('enrichment_cursor', 'r0');
+
+    const loop = new EnrichmentLoop(
+      new InMemoryQueryable(resources),
+      new StubMediaStore(),
+      async () => {},
+      store,
+    );
+    await loop.runPass();
+
+    expect(await store.getCrawlState('enrichment_cursor')).toBeNull();
+  });
+
+  it('does not delete the cursor when the pass fails (storage error)', async () => {
+    const store = new StubControlStateStore();
+    await store.saveCrawlState('enrichment_cursor', 'r0');
+    const deleteSpy = vi.spyOn(store, 'deleteCrawlState');
+
+    const loop = new EnrichmentLoop(
+      new ThrowingQueryable(),
+      new StubMediaStore(),
+      async () => {},
+      store,
+    );
+    const report = await loop.runPass();
+
+    expect(report.completedCleanly).toBe(false);
+    expect(deleteSpy).not.toHaveBeenCalled();
   });
 });
