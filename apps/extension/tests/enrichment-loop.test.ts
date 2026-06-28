@@ -9,6 +9,8 @@ import {
   IMediaStoreStatistics,
   ICleanupResult,
   IControlStateStore,
+  IStorageEngine,
+  ITransaction,
   IEnrichmentWorkItem,
   ResourceState,
   MediaType,
@@ -918,5 +920,284 @@ describe('EnrichmentLoop — self-rescheduling: stop', () => {
     // Wait to confirm no additional pass starts
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(runPassSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 4D — ENRICHED state promotion
+// ---------------------------------------------------------------------------
+
+/**
+ * In-memory IStorageEngine stub. Tracks saveResource calls so tests can
+ * inspect the saved resource state.
+ */
+class StubStorageEngine implements IStorageEngine {
+  readonly saved: IResource[] = [];
+  private shouldThrow = false;
+
+  /** Call this to make the next saveResource call throw. */
+  failNext(): void {
+    this.shouldThrow = true;
+  }
+
+  saveResource(resource: IResource): Promise<void> {
+    if (this.shouldThrow) {
+      this.shouldThrow = false;
+      return Promise.reject(new Error('storage write failed'));
+    }
+    this.saved.push(resource);
+    return Promise.resolve();
+  }
+
+  beginTransaction(): Promise<ITransaction> {
+    throw new Error('not implemented');
+  }
+  getResourceById(): Promise<null> {
+    return Promise.resolve(null);
+  }
+  deleteResource(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
+/**
+ * A queryable whose in-memory list is mutable — used to verify that repeated
+ * passes skip resources that have been promoted to ENRICHED.
+ */
+class MutableQueryable implements IResourceQueryable {
+  constructor(public resources: IResource[]) {}
+
+  async queryResources(query: IResourceQuery): Promise<IEnrichmentSelection> {
+    const filtered = this.resources.filter((r) => r.state === query.state);
+    const startIdx =
+      query.cursor !== undefined ? filtered.findIndex((r) => r.id === query.cursor) + 1 : 0;
+    const items = filtered.slice(startIdx, startIdx + query.pageSize);
+    const hasMore = startIdx + query.pageSize < filtered.length;
+    return {
+      items,
+      hasMore,
+      ...(hasMore ? { nextCursor: items[items.length - 1].id } : {}),
+    };
+  }
+}
+
+describe('EnrichmentLoop — Phase 4D: ENRICHED state promotion', () => {
+  it('promotes a HYDRATED resource to ENRICHED after successful OCR', async () => {
+    const resource = makeResource('r1', { mediaIds: [] });
+    const storage = new StubStorageEngine();
+
+    const loop = new EnrichmentLoop(
+      new InMemoryQueryable([resource]),
+      new StubMediaStore(),
+      async () => {},
+      undefined,
+      storage,
+    );
+    const report = await loop.runPass();
+
+    expect(report.resourcesEnriched).toBe(1);
+    expect(report.resourcesReady).toBe(1);
+    expect(storage.saved).toHaveLength(1);
+    expect(storage.saved[0].state).toBe(ResourceState.ENRICHED);
+    expect(storage.saved[0].completeness.ocr).toBe(true);
+  });
+
+  it('sets completeness.ocr = true on the saved resource', async () => {
+    const resource = makeResource('r1', { mediaIds: ['m1'] });
+    const storage = new StubStorageEngine();
+
+    const loop = new EnrichmentLoop(
+      new InMemoryQueryable([resource]),
+      new StubMediaStore([makeMetadata('m1')]),
+      async () => {},
+      undefined,
+      storage,
+    );
+    await loop.runPass();
+
+    expect(storage.saved[0].completeness.ocr).toBe(true);
+    expect(storage.saved[0].id).toBe('r1');
+  });
+
+  it('does not promote when OCR handler throws', async () => {
+    const resource = makeResource('r1', { mediaIds: [] });
+    const storage = new StubStorageEngine();
+
+    const loop = new EnrichmentLoop(
+      new InMemoryQueryable([resource]),
+      new StubMediaStore(),
+      async () => {
+        throw new Error('OCR failed');
+      },
+      undefined,
+      storage,
+    );
+    const report = await loop.runPass();
+
+    expect(report.resourcesEnriched).toBe(0);
+    expect(report.resourcesFailed).toBe(1);
+    expect(storage.saved).toHaveLength(0);
+  });
+
+  it('does not promote when persistence fails, and counts the resource as failed', async () => {
+    const resource = makeResource('r1', { mediaIds: [] });
+    const storage = new StubStorageEngine();
+    storage.failNext();
+
+    const loop = new EnrichmentLoop(
+      new InMemoryQueryable([resource]),
+      new StubMediaStore(),
+      async () => {},
+      undefined,
+      storage,
+    );
+    const report = await loop.runPass();
+
+    expect(report.resourcesEnriched).toBe(0);
+    expect(report.resourcesReady).toBe(0);
+    expect(report.resourcesFailed).toBe(1);
+    expect(storage.saved).toHaveLength(0);
+  });
+
+  it('does not promote resources with missing media blobs (keeps them HYDRATED for retry)', async () => {
+    const resource = makeResource('r1', { mediaIds: ['m_absent'] });
+    const storage = new StubStorageEngine();
+
+    const loop = new EnrichmentLoop(
+      new InMemoryQueryable([resource]),
+      new StubMediaStore(), // m_absent not in store
+      async () => {},
+      undefined,
+      storage,
+    );
+    const report = await loop.runPass();
+
+    expect(report.resourcesEnriched).toBe(0);
+    expect(report.resourcesWithMissingMedia).toBe(1);
+    expect(storage.saved).toHaveLength(0);
+  });
+
+  it('counts resourcesEnriched as a subset of resourcesReady', async () => {
+    const resources = [
+      makeResource('r1', { mediaIds: [] }),
+      makeResource('r2', { mediaIds: [] }),
+      makeResource('r3', { mediaIds: [] }),
+    ];
+    const storage = new StubStorageEngine();
+
+    const loop = new EnrichmentLoop(
+      new InMemoryQueryable(resources),
+      new StubMediaStore(),
+      async () => {},
+      undefined,
+      storage,
+    );
+    const report = await loop.runPass();
+
+    expect(report.resourcesEnriched).toBe(3);
+    expect(report.resourcesReady).toBe(3);
+  });
+
+  it('resourcesEnriched is 0 when no storageEngine is provided (backward compat)', async () => {
+    const resource = makeResource('r1', { mediaIds: [] });
+
+    // No storageEngine — fifth param omitted, same as existing test call-sites.
+    const loop = new EnrichmentLoop(
+      new InMemoryQueryable([resource]),
+      new StubMediaStore(),
+      async () => {},
+    );
+    const report = await loop.runPass();
+
+    expect(report.resourcesEnriched).toBe(0);
+    expect(report.resourcesReady).toBe(1); // still counts as ready
+  });
+
+  it('repeated passes do not re-process already ENRICHED resources', async () => {
+    // After the first pass, the storage engine save mutates the in-memory
+    // resource list to ENRICHED. On the second pass the HYDRATED query
+    // returns nothing, so no saveResource calls are made.
+    const mutableQueryable = new MutableQueryable([makeResource('r1', { mediaIds: [] })]);
+    const storage = new StubStorageEngine();
+
+    // Wire a handler that updates the in-memory list to reflect what the real
+    // storage engine would persist — simulates a durable round-trip.
+    const loop = new EnrichmentLoop(
+      mutableQueryable,
+      new StubMediaStore(),
+      async () => {},
+      undefined,
+      {
+        saveResource: async (resource: IResource) => {
+          const idx = mutableQueryable.resources.findIndex((r) => r.id === resource.id);
+          if (idx !== -1) mutableQueryable.resources[idx] = resource;
+          storage.saved.push(resource);
+        },
+        beginTransaction: storage.beginTransaction.bind(storage),
+        getResourceById: storage.getResourceById.bind(storage),
+        deleteResource: storage.deleteResource.bind(storage),
+      },
+    );
+
+    // First pass — should promote r1.
+    const report1 = await loop.runPass();
+    expect(report1.resourcesEnriched).toBe(1);
+    expect(storage.saved).toHaveLength(1);
+    expect(storage.saved[0].state).toBe(ResourceState.ENRICHED);
+
+    // Second pass — r1 is now ENRICHED, so the HYDRATED query returns nothing.
+    const report2 = await loop.runPass();
+    expect(report2.resourcesEnumerated).toBe(0);
+    expect(report2.resourcesEnriched).toBe(0);
+    expect(storage.saved).toHaveLength(1); // no new saves
+  });
+
+  it('maintains the counter invariant after mixed outcomes with a storageEngine', async () => {
+    const resources = [
+      makeResource('ready_will_enrich', { mediaIds: ['m1'] }),
+      makeResource('missing_media', { mediaIds: ['m_absent'] }),
+      makeResource('skipped', { mediaIds: [], mediaComplete: false }),
+      makeResource('handler_fail', { mediaIds: [] }),
+    ];
+    const mediaStore = new StubMediaStore([makeMetadata('m1')]);
+    const storage = new StubStorageEngine();
+
+    const loop = new EnrichmentLoop(
+      new InMemoryQueryable(resources),
+      mediaStore,
+      async (item) => {
+        if (item.resource.id === 'handler_fail') throw new Error('boom');
+      },
+      undefined,
+      storage,
+    );
+    const report = await loop.runPass();
+
+    expect(report.resourcesEnumerated).toBe(4);
+    expect(
+      report.resourcesReady +
+        report.resourcesWithMissingMedia +
+        report.resourcesSkipped +
+        report.resourcesFailed,
+    ).toBe(report.resourcesEnumerated);
+    expect(report.resourcesEnriched).toBe(1);
+    expect(report.resourcesEnriched).toBeLessThanOrEqual(report.resourcesReady);
+  });
+
+  it('promotion is idempotent: save is never called twice for the same resource in one pass', async () => {
+    const resource = makeResource('r1', { mediaIds: [] });
+    const storage = new StubStorageEngine();
+    const saveSpy = vi.spyOn(storage, 'saveResource');
+
+    const loop = new EnrichmentLoop(
+      new InMemoryQueryable([resource]),
+      new StubMediaStore(),
+      async () => {},
+      undefined,
+      storage,
+    );
+    await loop.runPass();
+
+    expect(saveSpy).toHaveBeenCalledTimes(1);
   });
 });

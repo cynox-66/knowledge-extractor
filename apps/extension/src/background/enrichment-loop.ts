@@ -2,6 +2,7 @@ import {
   IResourceQueryable,
   IMediaStore,
   IControlStateStore,
+  IStorageEngine,
   IEnrichmentWorkItem,
   IReconciliationReport,
   ResourceState,
@@ -30,9 +31,10 @@ function yieldToEventLoop(): Promise<void> {
  * for excessive synchronous CPU work.
  *
  * ### Crawl-loop independence
- * This class is read-only with respect to IndexedDB: it opens a separate
- * readonly cursor transaction per page and never writes. It is therefore
- * completely non-contending with the {@link CrawlController} write path.
+ * Read queries use a separate readonly cursor transaction per page. State
+ * promotion writes (`saveResource`) are short-lived per-resource transactions
+ * that do not hold a cursor open and therefore have minimal contention with
+ * the {@link CrawlController} write path.
  *
  * ### Phase contract
  * Reconciled {@link IEnrichmentWorkItem}s are delivered to the injected
@@ -52,6 +54,7 @@ export class EnrichmentLoop {
     private readonly mediaStore: IMediaStore,
     private readonly onWorkItem: (item: IEnrichmentWorkItem) => Promise<void> = async () => {},
     private readonly controlStateStore?: IControlStateStore,
+    private readonly storageEngine?: IStorageEngine,
   ) {}
 
   /**
@@ -98,6 +101,7 @@ export class EnrichmentLoop {
     let resourcesWithMissingMedia = 0;
     let resourcesSkipped = 0;
     let resourcesFailed = 0;
+    let resourcesEnriched = 0;
     let completedCleanly = false;
     let errorMessage: string | undefined;
 
@@ -145,9 +149,34 @@ export class EnrichmentLoop {
           // continues so a single bad item never aborts the entire pass.
           try {
             await this.onWorkItem({ resource, resolvedMedia });
+
             if (hasMissingMedia) {
+              // Blobs were absent — OCR could not run on all assets. Keep the
+              // resource HYDRATED so a later pass can retry once the blobs land.
               resourcesWithMissingMedia++;
+            } else if (this.storageEngine !== undefined) {
+              // OCR succeeded and all media was available — promote to ENRICHED.
+              // The state update must be durably persisted before the resource is
+              // counted as enriched; if the save fails the resource stays HYDRATED
+              // so the next pass can retry.
+              try {
+                await this.storageEngine.saveResource({
+                  ...resource,
+                  state: ResourceState.ENRICHED,
+                  completeness: { ...resource.completeness, ocr: true },
+                });
+                resourcesEnriched++;
+                resourcesReady++;
+              } catch (saveErr) {
+                resourcesFailed++;
+                this.logger.error(
+                  `Failed to persist enriched state for resource ${resource.id}`,
+                  saveErr,
+                );
+              }
             } else {
+              // No storage engine wired (e.g. in tests or Phase 3 stub usage) —
+              // count as ready but do not attempt state promotion.
               resourcesReady++;
             }
           } catch (itemErr) {
@@ -189,6 +218,7 @@ export class EnrichmentLoop {
       resourcesWithMissingMedia,
       resourcesSkipped,
       resourcesFailed,
+      resourcesEnriched,
       completedCleanly,
       ...(errorMessage !== undefined ? { error: errorMessage } : {}),
     };

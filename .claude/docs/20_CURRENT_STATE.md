@@ -1,10 +1,10 @@
 # Current State Dashboard
 
 ## Current Milestone
-Beta-2 (OCR Engine)
+Beta-2 (OCR Engine) — COMPLETE
 
 ## Current Objective
-Phase 4D: Implement ENRICHED state promotion. After a successful OCR pass, update the resource state to ENRICHED and set completeness.ocr = true.
+Transition to Beta-3. The OCR Enrichment pipeline is now complete and fully integrated into the background worker.
 
 ## Completed Milestones
 - Alpha Stabilization (Sprints A0-A4)
@@ -14,7 +14,8 @@ Phase 4D: Implement ENRICHED state promotion. After a successful OCR pass, updat
 - Beta-1.5 (Enrichment Read Path)
 - Beta-2 Phase 4A (OCR Engine)
 - Beta-2 Phase 4B (Enrichment Cursor Checkpointing)
-- **Beta-2 Phase 4C (Self-rescheduling)** — COMPLETE
+- Beta-2 Phase 4C (Self-rescheduling)
+- **Beta-2 Phase 4D (ENRICHED state promotion & Runtime Wiring)** — COMPLETE
 
 ## Active Branch
 `main`
@@ -23,17 +24,17 @@ Phase 4D: Implement ENRICHED state promotion. After a successful OCR pass, updat
 None.
 
 ## Recent Engineering Changes
-- **Beta-2 Phase 4C (Self-rescheduling):** 
-  - Made the enrichment pipeline a continuous background daemon.
-  - Added `chrome.alarms` scheduling after each clean pass to survive MV3 service worker suspensions.
-  - Implemented `_passInProgress` lock to prevent overlapping executions.
-  - Integrated `handleAlarm` in the background worker entry point.
-  - Added 13 new unit tests for self-rescheduling logic.
+- **Beta-2 Phase 4D:** 
+  - Implemented ENRICHED state promotion in `EnrichmentLoop`.
+  - Added `resourcesEnriched` to `IReconciliationReport`.
+  - Integrated `idbEngine` as the `storageEngine` in `index.ts` to enable runtime promotion.
+  - Added background persistence smoke test for the runtime wiring.
 
 ## Current Risks
 - **CRITICAL - Missing `eng.traineddata` asset:** The Tesseract.js English language data file (~10 MB) is not bundled via npm. It must be manually downloaded and placed at `apps/extension/public/tesseract/lang/eng.traineddata` before building, otherwise OCR will fail at runtime.
 - **Discovery Performance:** `MutationObserver` currently scans the entire document body, causing quadratic scaling on very large collections.
 - **Eviction window on final-page completion:** If the service worker is evicted after the final page is checkpointed but before `deleteCrawlState` runs, the next activation will run an empty pass and delete the cursor cleanly. This is safe but sub-optimal.
+- **Database contention:** Per-resource write transactions in the enrichment loop could cause contention with foreground crawler writes.
 
 ## Current Technical Debt
 - `Scheduler` and `MetricsCollector` lack automated unit test coverage.
@@ -41,7 +42,7 @@ None.
 - `IReconciliationReport` is logged but not persisted — no observable history of passes.
 
 ## Next Engineering Step
-Beta-2 Phase 4D: ENRICHED state promotion. See `40_NEXT_TASK.md` for full scope and exit criteria.
+Define Beta-3 milestone and proceed to Phase 5 (Data Export / Downstream integration). See `40_NEXT_TASK.md`.
 
 ## Definition of Current Success
-The crawler consistently extracts and hydrates resources into IndexedDB/OPFS across a 100+ item scroll without MV3 eviction, duplicate data, or missing metrics. Enrichment reconciliation pass runs to completion via offscreen OCR document, producing transcriptions. A multi-minute OCR pass correctly survives an MV3 eviction by resuming from its last checkpointed page. The loop automatically reschedules itself in the background.
+The crawler consistently extracts and hydrates resources into IndexedDB/OPFS across a 100+ item scroll without MV3 eviction, duplicate data, or missing metrics. Enrichment reconciliation pass runs to completion via offscreen OCR document, producing transcriptions, and successfully promotes processed resources to the `ENRICHED` state. The loop automatically reschedules itself in the background and correctly resumes from its last checkpointed page after MV3 eviction.

@@ -62,6 +62,13 @@ export interface IReconciliationReport {
    * the storage enumeration still ran to completion.
    */
   resourcesFailed: number;
+  /**
+   * Resources successfully promoted from {@link ResourceState.HYDRATED} to
+   * {@link ResourceState.ENRICHED} during this pass (i.e. OCR completed and
+   * the updated state was durably persisted). Always a subset of
+   * {@link resourcesReady}.
+   */
+  resourcesEnriched: number;
   /** `true` if the pass ran to completion without an unhandled error. */
   completedCleanly: boolean;
   /** Populated with the error message when {@link completedCleanly} is `false`. */

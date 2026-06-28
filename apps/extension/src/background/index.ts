@@ -141,6 +141,8 @@ const enrichmentLoop =
         idbEngine,
         mediaStore,
         ocrEngine !== null ? ocrEngine.process.bind(ocrEngine) : undefined,
+        controlStore,
+        idbEngine,
       )
     : null;
 

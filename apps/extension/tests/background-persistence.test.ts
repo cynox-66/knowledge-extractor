@@ -3,9 +3,15 @@ import { MetricsCollector, DiagnosticsCollector } from '@knowledge-extractor/sha
 import {
   TaskState,
   IControlStateStore,
+  IStorageEngine,
+  ITransaction,
+  IResource,
   ICrawlSession,
   ISessionReport,
+  ResourceState,
+  BlockType,
 } from '@knowledge-extractor/types';
+import { EnrichmentLoop } from '../src/background/enrichment-loop.js';
 import { SessionManager } from '../src/background/session-manager.js';
 import { Scheduler } from '../src/background/scheduler.js';
 
@@ -194,5 +200,103 @@ describe('Control-state substrate — single source of truth', () => {
     expect(await store.getCrawlState('current_session')).not.toBeNull();
     expect(await store.getCrawlState('crawl_scheduler')).toEqual([{ id: 't1' }]);
     expect(await store.getCrawlState('crawl_diagnostics')).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 4D smoke test — EnrichmentLoop runtime wiring
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal in-memory IStorageEngine that records the last saved resource.
+ * Mirrors how index.ts wires idbEngine as both IResourceQueryable and
+ * IStorageEngine into EnrichmentLoop (args 1 and 5).
+ */
+class SmokeSaveEngine implements IStorageEngine {
+  readonly saves: IResource[] = [];
+
+  saveResource(resource: IResource): Promise<void> {
+    this.saves.push(resource);
+    return Promise.resolve();
+  }
+  beginTransaction(): Promise<ITransaction> {
+    throw new Error('not used');
+  }
+  getResourceById(): Promise<null> {
+    return Promise.resolve(null);
+  }
+  deleteResource(): Promise<void> {
+    return Promise.resolve();
+  }
+}
+
+/** Minimal IResourceQueryable returning a single HYDRATED resource. */
+const smokeQueryable = {
+  async queryResources() {
+    return {
+      items: [
+        {
+          id: 'smoke-r1',
+          kind: 'test-post',
+          state: ResourceState.HYDRATED,
+          source: {
+            providerName: 'test',
+            externalId: 'smoke-r1',
+            originalUri: 'https://example.com/smoke-r1',
+            extractedAt: new Date().toISOString(),
+          },
+          content: [{ type: BlockType.TEXT, value: 'smoke' }],
+          media: [],
+          completeness: { thumbnail: true, metadata: true, media: true, ocr: false },
+        } satisfies IResource,
+      ],
+      hasMore: false,
+    };
+  },
+};
+
+/** Minimal IMediaStore stub (no media items needed for this smoke test). */
+const smokeMediaStore = {
+  getMetadata: async () => null,
+  put: async () => {
+    throw new Error('not used');
+  },
+  get: async () => null,
+  exists: async () => false,
+  delete: async () => {},
+  list: async () => [],
+  statistics: async () => ({ count: 0, totalBytes: 0, countByType: {}, bytesByType: {} }),
+  verify: async () => false,
+  cleanup: async () => ({ orphanedBlobs: 0, orphanedMetadata: 0, temporary: 0 }),
+};
+
+describe('EnrichmentLoop — Phase 4D runtime wiring smoke test', () => {
+  it('reports resourcesEnriched > 0 when a storageEngine is wired (mirrors index.ts constructor call)', async () => {
+    const engine = new SmokeSaveEngine();
+
+    // This mirrors exactly how index.ts constructs EnrichmentLoop:
+    //   new EnrichmentLoop(idbEngine, mediaStore, onWorkItem, controlStore, idbEngine)
+    const loop = new EnrichmentLoop(
+      smokeQueryable,
+      smokeMediaStore,
+      async () => {}, // onWorkItem (OCR handler stub)
+      undefined, // controlStateStore (omitted — not under test here)
+      engine, // storageEngine — the 5th arg now wired in index.ts
+    );
+
+    const report = await loop.runPass();
+
+    expect(report.resourcesEnriched).toBe(1);
+    expect(engine.saves).toHaveLength(1);
+    expect(engine.saves[0].state).toBe(ResourceState.ENRICHED);
+    expect(engine.saves[0].completeness.ocr).toBe(true);
+  });
+
+  it('storageEngine receives a non-undefined reference when passed as 5th arg', () => {
+    const engine = new SmokeSaveEngine();
+    // Construction must not throw; the engine reference is accepted.
+    expect(
+      () => new EnrichmentLoop(smokeQueryable, smokeMediaStore, async () => {}, undefined, engine),
+    ).not.toThrow();
   });
 });

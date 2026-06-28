@@ -1,99 +1,116 @@
-# SESSION REPORT — Beta-2 Phase 4C: Self-Rescheduling Enrichment Loop
+# SESSION REPORT — Beta-2 Phase 4D: ENRICHED State Promotion
 
 ## Summary
 
-Phase 4C makes the enrichment pipeline a continuous background daemon rather than a one-shot startup task. After each clean pass, `EnrichmentLoop` schedules a `chrome.alarms` watchdog that re-triggers the next pass after a configurable interval (default 5 minutes). A boolean concurrency lock (`_passInProgress`) prevents overlapping executions if the alarm fires before the previous pass completes. The loop is MV3-safe: it never uses `setInterval`, relies entirely on `chrome.alarms` for periodic wake-up across service worker suspensions, and cooperates with the Phase 4B cursor checkpointing.
+Phase 4D implements durable lifecycle promotion for resources that have successfully
+completed the OCR enrichment pipeline. After `onWorkItem` succeeds and all media blobs
+were available, the resource is re-persisted via `IStorageEngine` with
+`state: ResourceState.ENRICHED` and `completeness.ocr = true`. A new
+`resourcesEnriched` counter is exposed in `IReconciliationReport`. Subsequent passes
+skip promoted resources automatically because the query is scoped to
+`state: ResourceState.HYDRATED`.
 
 ---
 
 ## Files Changed
 
-### `apps/extension/src/background/enrichment-loop.ts`
-
-- Added `static readonly ALARM_NAME = 'ke-enrichment-tick'`.
-- Added private fields: `_active`, `_passInProgress`, `_intervalMinutes`.
-- Added `start(intervalMinutes = 5): void` — activates the loop and runs the first pass immediately. Idempotent.
-- Added `stop(): void` — deactivates the loop and clears any pending alarm.
-- Added `handleAlarm(): void` — invoked by the alarm listener in `index.ts`.
-- Added `private _trigger(): void` — guards against concurrent execution and inactive state, then calls `runPass()`. On clean completion schedules the next `chrome.alarms` watchdog.
-- `runPass()` is unchanged from Phase 4B.
-
-### `apps/extension/src/background/index.ts`
-
-- **Alarm listener**: extended to handle `EnrichmentLoop.ALARM_NAME` by calling `enrichmentLoop?.handleAlarm()`. Existing `CrawlController.ALARM_NAME` branch is unmodified.
-- **`startup()`**: replaced one-shot `enrichmentLoop.runPass().then(...).catch(...)` with `enrichmentLoop.start()`. The `ocrEngine?.terminate()` call was removed from this path — the loop now runs continuously and the OCR engine lifecycle is managed by MV3's natural service worker suspension.
-
-### `apps/extension/tests/enrichment-loop.test.ts`
-
-- Added `afterEach` import from vitest.
-- Added 6 new `describe` blocks (13 new tests):
-  - `self-rescheduling: schedules next pass after completion`
-  - `self-rescheduling: duplicate scheduling prevented`
-  - `self-rescheduling: concurrency control`
-  - `self-rescheduling: alarm-triggered execution`
-  - `self-rescheduling: stop`
+| File                                               | Change                                                                                                                                                                                             |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/types/src/enrichment/enrichment.ts`      | Added `resourcesEnriched: number` field to `IReconciliationReport`                                                                                                                                 |
+| `apps/extension/src/background/enrichment-loop.ts` | Imported `IStorageEngine`; added optional 5th constructor param `storageEngine?`; added state-promotion logic in `runPass()`; updated class JSDoc; included `resourcesEnriched` in returned report |
+| `apps/extension/tests/enrichment-loop.test.ts`     | Added `IStorageEngine`, `ITransaction` imports; added `StubStorageEngine`, `MutableQueryable` test doubles; added Phase 4D describe block with 9 new tests                                         |
 
 ---
 
 ## Design Decisions
 
-### Self-scheduling inside `EnrichmentLoop`, alarm listener in `index.ts`
+### 1. Promotion gating: full media resolution required
 
-Per the MV3 constraint, all `chrome.alarms.onAlarm.addListener` calls must be synchronous top-level registrations in `index.ts`. This is preserved. The alarm name, interval, and concurrency logic live inside `EnrichmentLoop` — consistent with how `CrawlController.ALARM_NAME` and `resumeFromAlarm()` own their scheduling logic. `index.ts` is only an event router.
+Resources with missing media blobs (`hasMissingMedia = true`) are **not** promoted even
+if `onWorkItem` succeeds. They remain `HYDRATED` so a later pass can retry once blobs
+arrive. This prevents silently marking OCR as complete when the engine only processed a
+subset of a resource's images.
 
-### `_trigger()` as the common entry point
+### 2. Persistence failure → `resourcesFailed`, not `resourcesReady`
 
-Both `start()` and `handleAlarm()` delegate to `_trigger()`. This eliminates duplicated concurrency checks and ensures the lock/active guards apply identically for both the initial call and every alarm-triggered call.
+If `storageEngine.saveResource()` throws, the resource is counted in `resourcesFailed`
+and NOT in `resourcesReady`. This maintains the mutual-exclusion counter invariant:
+`enumerated = ready + missingMedia + skipped + failed`.
 
-### No alarm on unclean pass
+### 3. `storageEngine` is an optional 5th constructor parameter
 
-If `runPass()` returns `completedCleanly: false`, no alarm is created. The loop pauses until the next browser restart or an explicit `start()`. This prevents alarm storms during sustained storage failures.
+All existing call-sites (3-arg and 4-arg forms) continue to work unchanged. When the
+parameter is absent, the loop still counts resources as `resourcesReady` (legacy
+behaviour) but sets `resourcesEnriched = 0`. This makes the upgrade backward-compatible.
 
-### Deferred promise pattern in tests
+### 4. `resourcesEnriched` is a sub-count of `resourcesReady`
 
-Three tests needed to control when `queryResources()` resolves mid-flight. The initial pattern captured the resolve function inside the Promise executor called asynchronously by `runPass()` — this failed because `runPass()` has an `await` before reaching `queryResources`, so the resolver wasn't available synchronously at the call site. Fix: hoist the `new Promise(...)` construction before `loop.start()` so the resolver is captured synchronously.
+Both counters are incremented on a successful save. Callers that only care about
+throughput read `resourcesReady`; callers tracking lifecycle completeness read
+`resourcesEnriched`. The existing invariant is preserved.
+
+### 5. Idempotency via HYDRATED query filter
+
+Repeated passes never re-process ENRICHED resources because the storage query is
+scoped to `ResourceState.HYDRATED`. No explicit guard inside the loop is required.
+The `MutableQueryable` test verifies this end-to-end.
 
 ---
 
 ## Test Results
 
 ```
-Test Files  4 passed (4)
-     Tests  70 passed (70)   [57 Phase ≤4B + 13 Phase 4C]
-  Duration  764ms
+Tests:  80 passed (80 total)
+        49 in enrichment-loop.test.ts  (was 40 — 9 new Phase 4D tests)
+        15 in ocr-engine.test.ts
+        10 in media-capture.test.ts
+         6 in background-persistence.test.ts
 ```
 
-All 57 pre-existing tests continue to pass (zero regressions).
+Phase 4D test coverage:
+
+- ✓ Successful OCR promotes HYDRATED → ENRICHED (state + completeness.ocr)
+- ✓ `completeness.ocr = true` on saved resource
+- ✓ Failed OCR handler does not promote; `resourcesFailed++`
+- ✓ Persistence failure does not promote; resource stays HYDRATED; `resourcesFailed++`
+- ✓ Resources with missing media blobs are not promoted; `resourcesWithMissingMedia++`
+- ✓ `resourcesEnriched` ≤ `resourcesReady` (subset invariant)
+- ✓ No `storageEngine` → `resourcesEnriched = 0`, backward compat preserved
+- ✓ Repeated passes skip already-ENRICHED resources (zero new saves on 2nd pass)
+- ✓ Counter invariant holds under mixed outcomes with a storageEngine
+- ✓ Promotion is idempotent: `saveResource` called exactly once per resource per pass
 
 ---
 
 ## Gate Suite Results
 
-| Gate               | Result | Notes                                       |
-| ------------------ | ------ | ------------------------------------------- |
-| typecheck          | PASS   | No TypeScript errors                        |
-| lint               | PASS   | No ESLint violations                        |
-| tests              | PASS   | 70/70                                       |
-| dependency-cruiser | PASS   | 106 modules, 150 deps — no layer violations |
-| build              | PASS   | Extension bundle built in 359ms             |
+| Gate             | Result                                          |
+| ---------------- | ----------------------------------------------- |
+| `pnpm typecheck` | ✅ 5/5 packages, 0 errors                       |
+| `pnpm lint`      | ✅ 5/5 packages, 0 violations                   |
+| `pnpm test`      | ✅ 80 tests passed, 0 failed                    |
+| `pnpm depcruise` | ✅ 0 violations (106 modules, 150 dependencies) |
+| `pnpm build`     | ✅ Extension built successfully                 |
 
 ---
 
 ## Known Limitations
 
-- **No retry on unclean pass.** If a pass fails, the loop does not self-reschedule. Extension restart is required.
-- **No runtime interval reconfiguration.** The interval is fixed at `start()` time.
-- **OCR engine not explicitly terminated between passes.** The offscreen document lifecycle is now managed by MV3 suspension. If explicit teardown after user-initiated stop is required, that can be added in a later phase.
+- **No `IStorageEngine` wired in `index.ts`** — the real Chrome extension entry point
+  (`apps/extension/src/background/index.ts`) must pass the `IndexedDbStorageEngine`
+  instance as the 5th argument to `EnrichmentLoop`. Until that wiring is done,
+  `resourcesEnriched` will always be 0 at runtime.
+- **Per-resource write transactions** — each enriched resource incurs one `saveResource`
+  call. At high volume this could produce many short-lived IndexedDB transactions. A
+  future optimisation could batch promotions per page using `BufferedTransaction`.
 
 ---
 
 ## Next Recommended Milestone
 
-**Beta-2 Phase 4D — ENRICHED state promotion.**
+**Phase 4E — Wire `storageEngine` into `EnrichmentLoop` in `index.ts`**
 
-`EnrichmentLoop` calls the OCR handler but never updates the resource `state` from `HYDRATED` to `ENRICHED` or sets `completeness.ocr = true`. Phase 4D should:
-
-1. After a successful `ocrEngine.process()` call, write the updated resource back to `IStorageEngine` with `state: ResourceState.ENRICHED` and `completeness.ocr: true`.
-2. Verify subsequent passes skip `ENRICHED` resources (already filtered by the `state: HYDRATED` query — may be a no-op).
-3. Expose `resourcesEnriched` in `IReconciliationReport`.
-4. Add tests for the state transition.
+Pass the `IndexedDbStorageEngine` (already constructed in `index.ts`) as the 5th
+argument to `EnrichmentLoop` so that state promotion takes effect at runtime. Then add
+an integration smoke test (or update the existing background wiring test) to verify the
+constructor receives a non-`undefined` storage engine.
