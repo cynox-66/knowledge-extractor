@@ -72,6 +72,13 @@ export interface ICrawlSession {
   navigationStatus: string;
   /** Current Scheduler queue depth (pending tasks awaiting processing). */
   queueDepth: number;
+  /**
+   * The browser tab this crawl is pinned to for its entire lifetime. Captured
+   * at `startCrawl` from the active Instagram tab and persisted so messaging
+   * survives service-worker suspension and popup/focus changes. Undefined until
+   * a crawl is started (the wrong-tab / "no active tab" defect, RCA-8).
+   */
+  tabId?: number;
 
   // ---- Canonical metrics snapshot -----------------------------------------
   metrics: IExtractionMetrics;

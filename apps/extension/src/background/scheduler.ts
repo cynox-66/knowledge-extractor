@@ -88,6 +88,23 @@ export class Scheduler {
     return task;
   }
 
+  /**
+   * Fails a task permanently in one shot, bypassing the retry/backoff loop.
+   * Used for non-retryable failures — e.g. the resource is not present in the
+   * DOM at all, where re-opening would only waste the modal-timeout budget
+   * (RCA-9). Returns the updated task (state `FAILED`), or null if unknown.
+   */
+  failPermanently(taskId: string, error: string): ICrawlTask | null {
+    const task = this.tasks.get(taskId);
+    if (!task) return null;
+    task.attempts = task.maxAttempts;
+    task.lastError = error;
+    task.state = TaskState.FAILED;
+    delete task.nextRetryAt;
+    this.logger.warn(`Task failed permanently (non-retryable): ${taskId}`);
+    return task;
+  }
+
   getPendingCount(): number {
     return Array.from(this.tasks.values()).filter((t) => t.state === TaskState.QUEUED).length;
   }

@@ -52,6 +52,13 @@ export interface ICaptureOutcome {
 export interface ICaptureTransport {
   capture(
     items: Array<{ id: string; sourceUri: string; type: MediaType; mimeType?: string }>,
+    /**
+     * The pinned tab to fetch from. The crawl owns exactly one Instagram tab
+     * for its lifetime (RCA-8); capture must target that tab, never whatever
+     * happens to be focused. Threaded explicitly so there is a single source of
+     * truth for "which tab" and no ambient `chrome.tabs.query` in this path.
+     */
+    tabId: number,
   ): Promise<ICaptureResponse>;
 }
 
@@ -92,7 +99,7 @@ export class MediaCaptureCoordinator {
    * `outcome.persisted === 0 && outcome.failures.length > 0` so the controller
    * can decide whether to treat the whole task as a capture failure.
    */
-  async hydrate(resource: IResource): Promise<ICaptureOutcome> {
+  async hydrate(resource: IResource, tabId: number): Promise<ICaptureOutcome> {
     const outcome: ICaptureOutcome = {
       resource,
       persisted: 0,
@@ -100,14 +107,14 @@ export class MediaCaptureCoordinator {
       failures: [],
     };
 
-    await this.hydrateInPlace(resource, outcome);
+    await this.hydrateInPlace(resource, outcome, tabId);
 
     // Children recurse (carousels). The parent's `media[]` and each child's
     // media must all have landed for the parent to be HYDRATED.
     let childMediaCompleteness = true;
     if (resource.children && resource.children.length > 0) {
       for (const child of resource.children) {
-        await this.hydrateInPlace(child, outcome);
+        await this.hydrateInPlace(child, outcome, tabId);
         if (!child.completeness.media) childMediaCompleteness = false;
         // A child resource is HYDRATED only if all of its own media landed.
         if (child.media.length > 0 && child.completeness.media) {
@@ -130,7 +137,11 @@ export class MediaCaptureCoordinator {
   }
 
   /** Captures and persists media owned directly by a single resource node. */
-  private async hydrateInPlace(node: IResource, outcome: ICaptureOutcome): Promise<void> {
+  private async hydrateInPlace(
+    node: IResource,
+    outcome: ICaptureOutcome,
+    tabId: number,
+  ): Promise<void> {
     const candidates = node.media.filter((m) => this.isFetchable(m));
     // Items we deliberately don't capture this milestone (videos, data:/blob:,
     // missing sourceUri) count as "skipped" — they do not block HYDRATED status
@@ -158,6 +169,7 @@ export class MediaCaptureCoordinator {
         type: m.type,
         ...(m.mimeType ? { mimeType: m.mimeType } : {}),
       })),
+      tabId,
     );
 
     const failuresById = new Map(response.failed.map((f) => [f.id, f]));

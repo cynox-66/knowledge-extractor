@@ -12,6 +12,9 @@ import { IInstagramParsedPost } from './types.js';
 
 export { DiscoveryEngine } from './discovery-engine.js';
 export { ResourceFingerprinter } from './fingerprinter.js';
+export { detectSurface, findOpenPostModal } from './surface.js';
+export type { SurfaceDescriptor, SurfaceKind, OpenMode } from './surface.js';
+export { findCarouselNext } from './carousel.js';
 export type { IInstagramParsedPost, InstagramPostLayout } from './types.js';
 
 /**

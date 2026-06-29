@@ -7,7 +7,13 @@
  */
 import { IDiscoveredResource } from '@knowledge-extractor/types';
 import { Logger, featureFlags, FeatureFlag, MetricsCollector } from '@knowledge-extractor/shared';
-import { DiscoveryEngine, InstagramConnector } from '@knowledge-extractor/connector-instagram';
+import {
+  DiscoveryEngine,
+  InstagramConnector,
+  detectSurface,
+  findOpenPostModal,
+  type SurfaceDescriptor,
+} from '@knowledge-extractor/connector-instagram';
 import { Navigator } from './navigator.js';
 
 const logger = new Logger('ContentScript');
@@ -15,6 +21,17 @@ const metrics = new MetricsCollector();
 const engine = new DiscoveryEngine();
 const connector = new InstagramConnector();
 const navigator = new Navigator();
+
+/**
+ * The surface this crawl is pinned to, captured when discovery starts. All
+ * navigation/scroll decisions use it so a transient modal permalink in the URL
+ * never reclassifies the surface mid-crawl (RCA-1/2). Falls back to the live
+ * URL if a handler somehow runs before RUN_PIPELINE.
+ */
+let crawlSurface: SurfaceDescriptor | null = null;
+function currentSurface(): SurfaceDescriptor {
+  return crawlSurface ?? detectSurface(location.href);
+}
 
 const pendingQueue: Array<{ resource: IDiscoveredResource; fingerprint: string }> = [];
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -48,7 +65,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.action === 'NAVIGATE_OPEN') {
     const { targetUri } = (message.data ?? {}) as { targetUri: string };
     navigator
-      .openResource(targetUri)
+      .open(targetUri, currentSurface())
       .then((result) => sendResponse(result))
       .catch((err) => sendResponse({ success: false, error: String(err) }));
     return true;
@@ -56,7 +73,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message.action === 'NAVIGATE_CLOSE') {
     navigator
-      .closeResource()
+      .close()
       .then((result) => sendResponse(result))
       .catch((err) => sendResponse({ success: false, error: String(err) }));
     return true;
@@ -64,7 +81,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
   if (message.action === 'NAVIGATE_SCROLL') {
     navigator
-      .scrollGrid()
+      .scroll(currentSurface())
       .then((result) => sendResponse(result))
       .catch((err) => sendResponse({ success: false, error: String(err) }));
     return true;
@@ -93,13 +110,16 @@ async function startDiscovery(): Promise<void> {
   }
 
   metrics.reset();
-  logger.info('Starting DiscoveryEngine');
+  // Pin the crawl surface for this page session (RCA-1/2). Captured here, on
+  // the base feed/grid URL, before any modal can push a permalink onto the URL.
+  crawlSurface = detectSurface(location.href);
+  logger.info(`Starting DiscoveryEngine on surface: ${crawlSurface.kind}`);
 
   engine.start((resource, fingerprint) => {
     metrics.recordDiscovered();
     pendingQueue.push({ resource, fingerprint });
     scheduleFlush();
-  });
+  }, crawlSurface);
 }
 
 function scheduleFlush(): void {
@@ -125,9 +145,15 @@ async function extractSingleResource(targetUri: string): Promise<{
   domSnapshot?: string;
   error?: string;
 }> {
-  // DOM concern: locate the target <article> for this URI (modal or feed),
-  // falling back to the single-post detail view's lone <article>.
-  const target = findArticleForUri(targetUri) ?? document.querySelector('article');
+  // DOM concern: locate the target <article> for this URI. Prefer an exact
+  // permalink match; then the open modal's article (grid surfaces); then the
+  // page's lone <article> (single-post detail view).
+  const modal = findOpenPostModal();
+  const target =
+    findArticleForUri(targetUri) ??
+    modal?.querySelector('article') ??
+    (modal?.matches('article') ? modal : null) ??
+    document.querySelector('article');
 
   if (!target) {
     return {
@@ -143,10 +169,58 @@ async function extractSingleResource(targetUri: string): Promise<{
   try {
     // Parsing concern: delegated entirely to the connector's strategy chain.
     const { post, strategyName } = connector.extract(target);
+
+    // Carousel traversal (RCA-7): Instagram renders one slide at a time, so the
+    // single extract above only saw the first slide. Walk the remaining slides
+    // and union their media so the resource captures the whole carousel.
+    const allMedia = await collectCarouselMedia(targetUri, target, post.mediaUris);
+    if (allMedia.length > post.mediaUris.length) {
+      post.mediaUris = allMedia;
+      post.slideUris = allMedia;
+      post.layout = 'carousel';
+    }
+
     return { success: true, data: post, strategyName };
   } catch (err) {
     return { success: false, domSnapshot, error: String(err) };
   }
+}
+
+/** Upper bound on carousel slides walked — guards against any non-terminating advance. */
+const MAX_CAROUSEL_SLIDES = 20;
+
+/**
+ * Walks a carousel from its current (first) slide to the last, unioning every
+ * slide's media URIs in order. Non-carousel posts return `initialMedia`
+ * unchanged because {@link Navigator.advanceCarousel} reports no Next control.
+ */
+async function collectCarouselMedia(
+  targetUri: string,
+  initialTarget: Element,
+  initialMedia: string[],
+): Promise<string[]> {
+  const ordered = [...initialMedia];
+  const seen = new Set(ordered);
+  const scope = (): ParentNode =>
+    findOpenPostModal() ?? findArticleForUri(targetUri) ?? initialTarget;
+
+  let walked = 0;
+  while (walked < MAX_CAROUSEL_SLIDES && (await navigator.advanceCarousel(scope()))) {
+    walked++;
+    const slide = findArticleForUri(targetUri) ?? (scope() as Element);
+    try {
+      const { post } = connector.extract(slide);
+      for (const uri of post.mediaUris) {
+        if (!seen.has(uri)) {
+          seen.add(uri);
+          ordered.push(uri);
+        }
+      }
+    } catch {
+      // A transient mid-transition read can fail; skip this slide's media.
+    }
+  }
+  return ordered;
 }
 
 /** Locates the <article> in the live DOM whose permalink matches `targetUri`. */

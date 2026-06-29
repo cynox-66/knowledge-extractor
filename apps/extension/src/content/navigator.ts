@@ -1,36 +1,59 @@
 import { Logger } from '@knowledge-extractor/shared';
+import {
+  type SurfaceDescriptor,
+  findOpenPostModal,
+  findCarouselNext,
+} from '@knowledge-extractor/connector-instagram';
 
 /**
- * Owns all browser state manipulation for the content script.
- * Responsible for: scrolling, opening modals, closing modals, waiting.
+ * Owns all browser state manipulation for the content script: scrolling,
+ * opening posts, closing modals, waiting.
+ *
+ * Every operation is **surface-aware** (RCA-1/2/4). The Navigator is generic
+ * mechanics; *what* to do per surface comes from the connector's
+ * {@link SurfaceDescriptor}:
+ *  - `home-feed` posts open **in place** (already rendered — never clicked into,
+ *    which is what used to navigate the crawl off into the author's profile);
+ *  - `grid` posts open as a **modal** detected via a robust multi-candidate
+ *    matcher rather than one frozen selector;
+ *  - scrolling targets the surface's real scroll container, not always `window`.
  */
 export class Navigator {
   private readonly logger = new Logger('Navigator');
 
   /**
-   * Scrolls the window down by one viewport height and waits for dynamic content to load.
+   * Scrolls the surface's scroll container by ~80% of its viewport to trigger
+   * lazy loading, then reports whether new content height appeared.
+   *
+   * The success/height signal is advisory only — the CrawlController no longer
+   * treats a single no-growth scroll as end-of-feed (RCA-3/4); it counts
+   * consecutive unproductive scrolls instead.
    */
-  async scrollGrid(): Promise<{ success: boolean; stabilizeMs?: number }> {
+  async scroll(surface: SurfaceDescriptor): Promise<{ success: boolean; stabilizeMs?: number }> {
     const start = performance.now();
-    const previousHeight = document.documentElement.scrollHeight;
+    const container = this.resolveScrollContainer(surface);
+    const heightOf = (): number =>
+      container ? container.scrollHeight : document.documentElement.scrollHeight;
+    const viewport = (): number => (container ? container.clientHeight : window.innerHeight);
+    const scrollBy = (dy: number): void => {
+      if (container) container.scrollBy(0, dy);
+      else window.scrollBy(0, dy);
+    };
 
-    // Scroll down by 80% of viewport height to trigger lazy load but keep some overlap
-    window.scrollBy(0, window.innerHeight * 0.8);
-
-    this.logger.debug('Scrolled down, waiting for DOM stabilization...');
-
-    // Wait for infinite scroll to trigger and render
+    const previousHeight = heightOf();
+    scrollBy(viewport() * 0.8);
+    this.logger.debug(
+      `Scrolled ${surface.kind} (${container ? 'container' : 'window'}); waiting for load…`,
+    );
     await this.sleep(1500);
 
-    const newHeight = document.documentElement.scrollHeight;
-
-    // If the scroll height didn't change, we might be at the bottom
-    if (newHeight === previousHeight) {
-      // Try one more small scroll just in case
-      window.scrollBy(0, window.innerHeight * 0.2);
+    if (heightOf() === previousHeight) {
+      // One more nudge before reporting no growth (the controller, not this
+      // method, decides termination).
+      scrollBy(viewport() * 0.2);
       await this.sleep(1000);
-      if (document.documentElement.scrollHeight === previousHeight) {
-        this.logger.info('Reached end of grid (no new height after scroll)');
+      if (heightOf() === previousHeight) {
+        this.logger.info(`No new height after scrolling ${surface.kind}`);
         return { success: false, stabilizeMs: performance.now() - start };
       }
     }
@@ -39,110 +62,182 @@ export class Navigator {
   }
 
   /**
-   * Attempts to open the resource specified by targetUri in the current tab.
-   * Uses Option A (Modal navigation) for grid items.
+   * Opens the resource for extraction according to the surface's open mode.
+   * Returns success once the post's `<article>` is present and stable.
    */
-  async openResource(targetUri: string): Promise<{
+  async open(
+    targetUri: string,
+    surface: SurfaceDescriptor,
+  ): Promise<{
     success: boolean;
     openLatencyMs?: number;
     domStabilizeMs?: number;
     error?: string;
   }> {
-    // 1. Try to find the thumbnail link in the grid
-    const links = Array.from(
-      document.querySelectorAll<HTMLAnchorElement>('a[href*="/p/"], a[href*="/reel/"]'),
-    );
-    const targetLink = links.find(
-      (l) => l.href === targetUri || l.href.includes(new URL(targetUri).pathname),
-    );
-
-    if (targetLink) {
-      this.logger.debug(`Clicking thumbnail for ${targetUri}`);
-
-      // Ensure element is in view before clicking to avoid some overlay issues
-      targetLink.scrollIntoView({ block: 'center', behavior: 'instant' });
-      await this.sleep(100);
-
-      // We dispatch a click event
-      const clickTime = performance.now();
-      targetLink.click();
-
-      // Wait for the modal article to appear
-      const modalLoaded = await this.waitForSelector('article[role="presentation"]', 5000);
-      const openLatencyMs = performance.now() - clickTime;
-
-      if (!modalLoaded) {
-        this.logger.warn(`Modal failed to load for ${targetUri}`);
-        // Attempt to close if it's stuck half-open
-        await this.closeResource();
-        return { success: false, openLatencyMs, error: 'Modal timeout' };
-      }
-
-      // Give it a brief moment for dynamic content (images, video) to hydrate
-      const stabilizeStart = performance.now();
-      await this.sleep(500);
-      const domStabilizeMs = performance.now() - stabilizeStart;
-      return { success: true, openLatencyMs, domStabilizeMs };
-    }
-
-    // 2. If no link is found, we might already be on a feed/detail page where the article is fully loaded
-    const article = Array.from(document.querySelectorAll('article')).find((a) => {
-      const link = a.querySelector<HTMLAnchorElement>('a[href*="/p/"], a[href*="/reel/"]');
-      return link && (link.href === targetUri || link.href.includes(new URL(targetUri).pathname));
-    });
-
-    if (article) {
-      this.logger.debug(`Resource already open in feed for ${targetUri}`);
-      article.scrollIntoView({ block: 'center', behavior: 'instant' });
-      const stabilizeStart = performance.now();
-      await this.sleep(200);
-      return {
-        success: true,
-        openLatencyMs: 0,
-        domStabilizeMs: performance.now() - stabilizeStart,
-      };
-    }
-
-    this.logger.error(`Could not locate resource in DOM to open: ${targetUri}`);
-    return { success: false, error: 'Not found in DOM' };
+    return surface.openMode === 'modal' ? this.openModal(targetUri) : this.openInPlace(targetUri);
   }
 
   /**
-   * Closes the currently open modal (if any).
+   * In-place open (home feed / reels): the post is already rendered, so we only
+   * locate and center it. We deliberately never click its permalink — that is a
+   * real SPA navigation that used to carry the crawl into the author's profile
+   * (RCA-2).
    */
-  async closeResource(): Promise<{ success: boolean; closeDurationMs?: number }> {
+  private async openInPlace(targetUri: string): Promise<{
+    success: boolean;
+    openLatencyMs?: number;
+    domStabilizeMs?: number;
+    error?: string;
+  }> {
+    const article = this.findArticleForUri(targetUri);
+    if (!article) {
+      this.logger.warn(`In-place resource not found in feed: ${targetUri}`);
+      return { success: false, error: 'Not found in feed' };
+    }
+    article.scrollIntoView({ block: 'center', behavior: 'instant' });
+    const stabilizeStart = performance.now();
+    await this.sleep(200);
+    return {
+      success: true,
+      openLatencyMs: 0,
+      domStabilizeMs: performance.now() - stabilizeStart,
+    };
+  }
+
+  /**
+   * Modal open (grid surfaces): click the thumbnail and wait for a real post
+   * modal, validated by a multi-candidate detector instead of one brittle
+   * selector (RCA-1).
+   */
+  private async openModal(targetUri: string): Promise<{
+    success: boolean;
+    openLatencyMs?: number;
+    domStabilizeMs?: number;
+    error?: string;
+  }> {
+    const targetLink = this.findThumbnailForUri(targetUri);
+    if (!targetLink) {
+      this.logger.error(`Could not locate grid thumbnail to open: ${targetUri}`);
+      return { success: false, error: 'Thumbnail not found in DOM' };
+    }
+
+    targetLink.scrollIntoView({ block: 'center', behavior: 'instant' });
+    await this.sleep(100);
+
+    const clickTime = performance.now();
+    targetLink.click();
+
+    const modalOpened = await this.waitFor(() => findOpenPostModal() !== null, 5000);
+    const openLatencyMs = performance.now() - clickTime;
+
+    if (!modalOpened) {
+      this.logger.warn(`Modal failed to open for ${targetUri}`);
+      await this.close(); // best-effort cleanup if it half-opened
+      return { success: false, openLatencyMs, error: 'Modal timeout' };
+    }
+
+    const stabilizeStart = performance.now();
+    await this.sleep(500);
+    return { success: true, openLatencyMs, domStabilizeMs: performance.now() - stabilizeStart };
+  }
+
+  /**
+   * Closes an open post modal, if any, and confirms it is gone so the grid is
+   * restored before the crawl continues. A no-op (success) when no modal is
+   * open — e.g. after in-place extraction.
+   */
+  async close(): Promise<{ success: boolean; closeDurationMs?: number }> {
     const start = performance.now();
-    // Instagram modal close button usually has an SVG with aria-label "Close"
+    if (findOpenPostModal() === null) {
+      return { success: true, closeDurationMs: 0 };
+    }
+
     const closeBtn =
-      document.querySelector<HTMLButtonElement>('svg[aria-label="Close"]')?.closest('button') ||
+      document.querySelector<HTMLButtonElement>('svg[aria-label="Close"]')?.closest('button') ??
       document.querySelector<HTMLButtonElement>('div[role="dialog"] button');
 
     if (closeBtn) {
-      this.logger.debug('Clicking close button on modal');
+      this.logger.debug('Clicking modal close button');
       closeBtn.click();
-      await this.sleep(300); // Wait for modal to animate out
-      return { success: true, closeDurationMs: performance.now() - start };
     } else {
-      // Fallback: If there's a dialog but no close button, try pressing Escape
-      const dialog = document.querySelector('div[role="dialog"]');
-      if (dialog) {
-        this.logger.debug('No close button found, dispatching Escape key');
-        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-        await this.sleep(300);
-        return { success: true, closeDurationMs: performance.now() - start };
-      }
+      this.logger.debug('No close button; dispatching Escape');
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     }
-    return { success: true, closeDurationMs: 0 };
+
+    // Confirm the modal actually closed (restores grid context for the route
+    // guard) before reporting success.
+    const closed = await this.waitFor(() => findOpenPostModal() === null, 2000);
+    if (!closed) this.logger.warn('Modal did not close within timeout');
+    return { success: closed, closeDurationMs: performance.now() - start };
+  }
+
+  /**
+   * Advances a carousel to its next slide, scoped to `scope` (the post element)
+   * so it never clicks a neighbouring post's control on the home feed. Returns
+   * `false` when there is no Next control — the last slide, or a non-carousel
+   * post — which is how the caller's collection loop terminates (RCA-7).
+   */
+  async advanceCarousel(scope: ParentNode): Promise<boolean> {
+    const next = findCarouselNext(scope);
+    if (!next) return false;
+    next.click();
+    // Allow the slide transition to settle before the caller re-reads media.
+    await this.sleep(600);
+    return true;
+  }
+
+  // ---- DOM helpers ----------------------------------------------------------
+
+  /** Resolves the surface's scroll container, or `null` to scroll the window. */
+  private resolveScrollContainer(surface: SurfaceDescriptor): HTMLElement | null {
+    for (const selector of surface.scrollContainerSelectors) {
+      const el = document.querySelector<HTMLElement>(selector);
+      // Only treat it as the scroller if it can actually scroll.
+      if (el && el.scrollHeight > el.clientHeight) return el;
+    }
+    return null;
+  }
+
+  /** Finds the in-DOM `<article>` whose permalink matches `targetUri`. */
+  private findArticleForUri(targetUri: string): Element | undefined {
+    const pathname = this.safePathname(targetUri);
+    return Array.from(document.querySelectorAll('article')).find((a) => {
+      const link =
+        a.querySelector<HTMLAnchorElement>('a[href*="/p/"]') ??
+        a.querySelector<HTMLAnchorElement>('a[href*="/reel/"]');
+      if (!link) return false;
+      return link.href === targetUri || (pathname !== '' && link.href.includes(pathname));
+    });
+  }
+
+  /** Finds the grid thumbnail anchor whose permalink matches `targetUri`. */
+  private findThumbnailForUri(targetUri: string): HTMLAnchorElement | undefined {
+    const pathname = this.safePathname(targetUri);
+    const links = Array.from(
+      document.querySelectorAll<HTMLAnchorElement>('a[href*="/p/"], a[href*="/reel/"]'),
+    );
+    return links.find(
+      (l) => l.href === targetUri || (pathname !== '' && l.href.includes(pathname)),
+    );
+  }
+
+  private safePathname(uri: string): string {
+    try {
+      return new URL(uri).pathname;
+    } catch {
+      return '';
+    }
   }
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  private async waitForSelector(selector: string, timeoutMs: number): Promise<boolean> {
+  /** Polls `predicate` until true or the timeout elapses. */
+  private async waitFor(predicate: () => boolean, timeoutMs: number): Promise<boolean> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-      if (document.querySelector(selector)) return true;
+      if (predicate()) return true;
       await this.sleep(100);
     }
     return false;

@@ -20,7 +20,7 @@ import { Scheduler } from './scheduler.js';
 import { MediaCaptureCoordinator } from './media-capture.js';
 
 /** Pipeline stage, used to categorize failures without bespoke error classes. */
-type Stage = 'navigation' | 'extraction' | 'normalization' | 'capture';
+type Stage = 'navigation' | 'extraction' | 'normalization' | 'persistence' | 'capture';
 
 /** The shape the content script returns from EXTRACT_RESOURCE. */
 interface ExtractResponse {
@@ -55,6 +55,15 @@ export class CrawlController {
   private static readonly DIAG_KEY = 'crawl_diagnostics';
   private static readonly TICK_MS = 800;
   private static readonly MAX_EMPTY_SCROLLS = 3;
+  /**
+   * Discovery readiness barrier (RCA-3). Before the loop may act on an empty
+   * queue (scroll or terminate), discovery must have had this long to report
+   * since the last discovery opportunity (crawl start or a completed scroll).
+   * Covers the content-script DiscoveryEngine's MutationObserver, its 150 ms
+   * flush debounce, and the message round-trip, so the loop can no longer
+   * outrun discovery and declare a premature end-of-feed.
+   */
+  private static readonly DISCOVERY_SETTLE_MS = 1500;
 
   private readonly logger = new Logger('CrawlController');
   private readonly sessionManager: SessionManager;
@@ -73,6 +82,13 @@ export class CrawlController {
   private loopTimer: ReturnType<typeof setTimeout> | null = null;
   private isProcessing = false;
   private emptyScrolls = 0;
+  /**
+   * Timestamp (ms) of the last discovery opportunity — set when discovery is
+   * kicked and after every scroll. The readiness barrier in
+   * {@link handleQueueDrained} refuses to scroll/terminate until
+   * {@link DISCOVERY_SETTLE_MS} has elapsed since this point (RCA-3).
+   */
+  private lastDiscoveryOpportunityAt = 0;
 
   constructor(
     metrics: MetricsCollector,
@@ -107,6 +123,7 @@ export class CrawlController {
     const session = this.sessionManager.getSession();
     if (session?.isRunning && !session.isPaused) {
       this.logger.info('Active crawl detected on startup — resuming');
+      this.markDiscoveryOpportunity();
       await this.ensureAlarm();
       this.kickLoop();
     }
@@ -114,23 +131,34 @@ export class CrawlController {
   }
 
   async startCrawl(): Promise<ICrawlSession> {
+    // Pin the tab for the whole crawl (RCA-8). We capture the active tab once,
+    // here, where `activeTab` permission is freshly granted by the popup click,
+    // and refuse to start unless it is a real Instagram tab. Every later
+    // message (navigate/extract/scroll/capture) targets this id — never an
+    // ambient "active tab" that can change when focus moves.
+    const tab = await this.activeTab();
+    if (tab?.id === undefined || !this.isInstagramUrl(tab.url)) {
+      throw new Error('Open an Instagram tab and focus it before starting a crawl');
+    }
+
     const session = this.sessionManager.startNewSession();
+    await this.sessionManager.update({ tabId: tab.id });
     this.scheduler.clear();
     this.emptyScrolls = 0;
+    this.markDiscoveryOpportunity();
     await this.persistScheduler();
 
-    const pageUrl = await this.activeTabUrl();
-    this.diagnostics.reset(pageUrl);
+    this.diagnostics.reset(tab.url ?? '');
     await this.persistDiagnostics();
 
     await this.ensureAlarm();
-    this.broadcastEvent('CRAWL_STARTED', { sessionId: session.sessionId });
+    this.broadcastEvent('CRAWL_STARTED', { sessionId: session.sessionId, tabId: tab.id });
 
     // Kick discovery in the content script (DiscoveryEngine lives there).
-    await this.sendToActiveTab({ action: 'RUN_PIPELINE' }).catch(() => {});
+    await this.sendToTab(tab.id, { action: 'RUN_PIPELINE' }).catch(() => {});
 
     this.kickLoop();
-    return session;
+    return this.sessionManager.getSession() ?? session;
   }
 
   async pauseCrawl(): Promise<void> {
@@ -142,6 +170,7 @@ export class CrawlController {
 
   async resumeCrawl(): Promise<void> {
     await this.sessionManager.update({ isPaused: false, navigationStatus: 'idle' });
+    this.markDiscoveryOpportunity();
     await this.ensureAlarm();
     this.kickLoop();
     this.broadcastEvent('CRAWL_RESUMED', {});
@@ -211,6 +240,10 @@ export class CrawlController {
     const session = this.sessionManager.getSession();
     if (session?.isRunning && !session.isPaused && !this.loopTimer) {
       this.logger.debug('Alarm watchdog resuming processing loop');
+      // The worker was suspended; give discovery a fresh settle window so the
+      // revived loop doesn't conclude end-of-feed before the content script
+      // re-reports (RCA-3).
+      this.markDiscoveryOpportunity();
       this.kickLoop();
     }
   }
@@ -245,17 +278,25 @@ export class CrawlController {
   private async processNext(): Promise<void> {
     if (this.isProcessing) return;
 
+    // Resolve the pinned tab once per cycle. If it has been closed (or never
+    // pinned), abandon the crawl rather than burning retries against a dead
+    // tab — this is the deterministic, single-owner replacement for the old
+    // "active tab" lookups (RCA-8).
+    const tabId = await this.resolveSessionTabId();
+    if (tabId === null) {
+      await this.finishCrawl('tab-closed');
+      return;
+    }
+
     const task = this.scheduler.getNextTask();
     if (!task) {
-      await this.handleQueueDrained();
+      await this.handleQueueDrained(tabId);
       return;
     }
 
     this.isProcessing = true;
     let stage: Stage = 'navigation';
     try {
-      const tabId = await this.requireActiveTabId();
-
       await this.sessionManager.update({
         currentResource: task.targetUri,
         navigationStatus: 'opening',
@@ -308,43 +349,57 @@ export class CrawlController {
       this.metrics.recordNormalized(performance.now() - normStart);
       this.broadcastEvent('RESOURCE_NORMALIZED', { resourceId: normalized.id });
 
-      // --- Capture ---
-      // Hydrate media bytes from the authenticated tab into the MediaStore
-      // BEFORE persisting the resource, so the on-disk record reflects the
-      // bytes actually captured (`localUri`, `state=HYDRATED` when complete).
+      // --- Persistence (knowledge-first) ---
+      // Persist the extracted resource immediately. Knowledge durability is
+      // NEVER gated on media capture (RCA-6): a CDN 403 / network error must not
+      // discard a successfully extracted post. The task is COMPLETE the moment
+      // the resource is durable; media hydration below only upgrades it.
+      stage = 'persistence';
+      await this.persistResource(normalized);
+      this.metrics.recordPersisted();
+      this.scheduler.markCompleted(task.id);
+      this.emptyScrolls = 0;
+      this.broadcastEvent('RESOURCE_PERSISTED', { resourceId: normalized.id });
+
+      // --- Capture (best-effort hydration; non-fatal) ---
+      // Fetch media bytes from the pinned authenticated tab and upgrade the
+      // already-persisted record (`localUri`, `state=HYDRATED`). Any failure is
+      // recorded to diagnostics but never fails the task and never rolls back
+      // the persisted knowledge. Transient media retries are the enrichment
+      // path's concern, not the crawl task's.
       stage = 'capture';
       await this.sessionManager.update({ navigationStatus: 'capturing' });
-      const captureOutcome = await this.mediaCapture.hydrate(normalized);
-      for (const failure of captureOutcome.failures) {
+      try {
+        const captureOutcome = await this.mediaCapture.hydrate(normalized, tabId);
+        for (const failure of captureOutcome.failures) {
+          this.diagnostics.recordFailure(
+            failure.sourceUri,
+            'network_error',
+            `Media capture failed: ${failure.reason}`,
+            { failingStrategy: 'capture' },
+          );
+        }
+        if (captureOutcome.persisted > 0) {
+          // The resource was mutated in place (localUri / HYDRATED state); the
+          // re-save reflects the captured bytes. `saveResource` is idempotent.
+          await this.persistResource(normalized);
+        }
+        this.broadcastEvent('RESOURCE_HYDRATED', {
+          resourceId: normalized.id,
+          persisted: captureOutcome.persisted,
+          failed: captureOutcome.failures.length,
+          skipped: captureOutcome.skipped,
+        });
+      } catch (captureErr) {
+        // Non-fatal: the resource is already durable. Surface in diagnostics only.
         this.diagnostics.recordFailure(
-          failure.sourceUri,
-          'selector_failure',
-          `Media capture failed: ${failure.reason}`,
+          task.targetUri,
+          'network_error',
+          `Media hydration error: ${captureErr instanceof Error ? captureErr.message : String(captureErr)}`,
           { failingStrategy: 'capture' },
         );
       }
-      // If we attempted to fetch media but landed nothing, treat the whole
-      // task as a capture failure — retry path handles transient errors.
-      const attemptedCapture = captureOutcome.persisted + captureOutcome.failures.length > 0;
-      if (attemptedCapture && captureOutcome.persisted === 0) {
-        throw new Error(`Media capture failed for all ${captureOutcome.failures.length} item(s)`);
-      }
-      this.broadcastEvent('RESOURCE_HYDRATED', {
-        resourceId: normalized.id,
-        persisted: captureOutcome.persisted,
-        failed: captureOutcome.failures.length,
-        skipped: captureOutcome.skipped,
-      });
 
-      // --- Persistence ---
-      const tx = await this.storage.beginTransaction();
-      await this.storage.saveResource(normalized, tx);
-      await tx.commit();
-      this.metrics.recordPersisted();
-      this.broadcastEvent('RESOURCE_PERSISTED', { resourceId: normalized.id });
-
-      this.scheduler.markCompleted(task.id);
-      this.emptyScrolls = 0;
       this.broadcastEvent('EXTRACTION_COMPLETED', {
         targetUri: task.targetUri,
         resourceId: normalized.id,
@@ -369,12 +424,20 @@ export class CrawlController {
     // Stage-specific failure counters. Capture failures share the
     // post-extraction failure counter (the metric set is frozen at Layer 0;
     // the per-stage label flows through the diagnostic record).
+    // The Layer-0 metric set is frozen; normalization and persistence share the
+    // post-extraction failure counter while the precise stage flows through the
+    // diagnostic record's category.
     if (stage === 'navigation') this.metrics.recordNavigationFailure();
     else if (stage === 'extraction') this.metrics.recordExtractionFailure();
     else this.metrics.recordNormalizationFailure();
 
-    // Apply retry policy (exponential backoff lives in the Scheduler).
-    const updated = this.scheduler.markFailed(task.id, message);
+    // Apply retry policy (exponential backoff lives in the Scheduler). Failures
+    // that re-opening cannot fix (the resource simply isn't in the DOM) are
+    // failed immediately instead of burning the retry/modal-timeout budget
+    // (RCA-9).
+    const updated = this.isNonRetryable(stage, message)
+      ? this.scheduler.failPermanently(task.id, message)
+      : this.scheduler.markFailed(task.id, message);
     const permanent = updated?.state === 'failed';
     if (permanent) {
       this.metrics.recordFailurePermanent();
@@ -397,39 +460,72 @@ export class CrawlController {
     });
   }
 
+  /**
+   * Whether a failure is inherently non-retryable. "Not found in DOM" outcomes
+   * (the thumbnail/article isn't on the page) won't change on a re-open, so they
+   * are failed permanently rather than retried with backoff (RCA-9). Transient
+   * causes — modal timeouts, storage hiccups — remain on the retry path.
+   */
+  private isNonRetryable(stage: Stage, message: string): boolean {
+    if (stage === 'navigation') return /not found/i.test(message);
+    if (stage === 'extraction') return /no article element/i.test(message);
+    return false;
+  }
+
   private categoryFor(stage: Stage): FailureCategory {
     if (stage === 'navigation') return 'selector_failure';
     if (stage === 'extraction') return 'parsing_failure';
     if (stage === 'capture') return 'network_error';
+    if (stage === 'persistence') return 'unknown';
     return 'normalization_failure';
   }
 
-  /** Drives infinite scroll when the queue empties; terminates at end-of-feed. */
-  private async handleQueueDrained(): Promise<void> {
+  /**
+   * Drives infinite scroll when the queue empties; terminates at end-of-feed.
+   *
+   * Two invariants make termination robust (RCA-3, RCA-4):
+   *  1. **Readiness barrier** — the loop never scrolls or terminates until
+   *     {@link DISCOVERY_SETTLE_MS} has elapsed since the last discovery
+   *     opportunity. While inside that window it simply yields back to the tick
+   *     loop, which polls again. This is what stops the loop outrunning the
+   *     content-script DiscoveryEngine and declaring a premature end-of-feed.
+   *  2. **No single false negative terminates** — a scroll that reports no new
+   *     height increments `emptyScrolls` like any other; the crawl ends only
+   *     after {@link MAX_EMPTY_SCROLLS} *consecutive* unproductive scrolls.
+   *     Newly discovered work resets `emptyScrolls` to 0 (see
+   *     {@link handleDiscoveryBatch} and the per-resource success path).
+   *
+   * @param tabId The pinned, already-validated crawl tab (RCA-8).
+   */
+  private async handleQueueDrained(tabId: number): Promise<void> {
     if (!this.scheduler.isDrained()) return; // tasks still mid-flight
 
+    // (1) Readiness barrier: give discovery its settle window before acting.
+    if (Date.now() - this.lastDiscoveryOpportunityAt < CrawlController.DISCOVERY_SETTLE_MS) {
+      return; // poll again on the next tick; do not scroll or terminate yet
+    }
+
+    // (2) End-of-feed only after MAX consecutive unproductive scrolls.
     if (this.emptyScrolls >= CrawlController.MAX_EMPTY_SCROLLS) {
       await this.finishCrawl('feed-exhausted');
       return;
     }
 
-    const tabId = await this.activeTabId();
-    if (tabId === null) {
-      await this.finishCrawl('no-active-tab');
-      return;
-    }
-
     await this.sessionManager.update({ navigationStatus: 'scrolling' });
-    const scroll = await this.sendToTab(tabId, { action: 'NAVIGATE_SCROLL' }).catch(() => null);
+    // The Navigator's success/height signal is deliberately not used as a
+    // terminal condition (RCA-4): a single no-growth reading must not end the
+    // crawl. Productivity is judged solely by whether discovery reports new work
+    // during the settle window below, which resets `emptyScrolls`.
+    await this.sendToTab(tabId, { action: 'NAVIGATE_SCROLL' }).catch(() => undefined);
 
-    if (!scroll || scroll.success === false) {
-      // Navigator reports no new height → bottom of the feed.
-      await this.finishCrawl('end-of-feed');
-      return;
-    }
+    // A scroll exposes new content asynchronously (lazy load → MutationObserver
+    // → flush → RESOURCES_DISCOVERED). Open a fresh discovery window so the next
+    // drain waits for that pipeline before counting this scroll as unproductive.
+    this.markDiscoveryOpportunity();
 
-    // Scroll succeeded; new content (if any) arrives via RESOURCES_DISCOVERED.
-    // If repeated scrolls yield no new work, emptyScrolls trips end-of-feed.
+    // Count every scroll attempt — whether it reported new height or not. If it
+    // produced new work, the discovery batch resets the counter during the
+    // settle window above; otherwise consecutive empties trip end-of-feed.
     this.emptyScrolls++;
   }
 
@@ -488,25 +584,55 @@ export class CrawlController {
     await chrome.alarms.clear(CrawlController.ALARM_NAME);
   }
 
-  private async activeTabId(): Promise<number | null> {
+  /**
+   * The currently active tab in the focused window. Used **only** at
+   * {@link startCrawl} to pin the crawl tab, where `activeTab` permission is
+   * freshly granted by the popup click. The running loop never queries the
+   * active tab again — it uses the pinned id (RCA-8).
+   */
+  private async activeTab(): Promise<chrome.tabs.Tab | undefined> {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-    return tabs[0]?.id ?? null;
+    return tabs[0];
   }
 
-  private async requireActiveTabId(): Promise<number> {
-    const id = await this.activeTabId();
-    if (id === null) throw new Error('No active tab');
-    return id;
+  /**
+   * Resolves the pinned crawl tab from the persisted session and verifies it
+   * still exists. Returns `null` if no tab was pinned or it has been closed, so
+   * callers can deterministically finish the crawl instead of messaging a dead
+   * or wrong tab.
+   */
+  private async resolveSessionTabId(): Promise<number | null> {
+    const tabId = this.sessionManager.getSession()?.tabId;
+    if (typeof tabId !== 'number') return null;
+    try {
+      await chrome.tabs.get(tabId); // rejects if the tab no longer exists
+      return tabId;
+    } catch {
+      return null;
+    }
   }
 
-  private async activeTabUrl(): Promise<string> {
-    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-    return tabs[0]?.url ?? '';
+  private isInstagramUrl(url: string | undefined): boolean {
+    if (!url) return false;
+    try {
+      return new URL(url).hostname.endsWith('instagram.com');
+    } catch {
+      return false;
+    }
   }
 
-  private async sendToActiveTab(message: unknown): Promise<NavResponse> {
-    const id = await this.requireActiveTabId();
-    return this.sendToTab(id, message);
+  /** Opens a fresh discovery settle window (RCA-3). */
+  private markDiscoveryOpportunity(): void {
+    this.lastDiscoveryOpportunityAt = Date.now();
+  }
+
+  /** Persists a single resource in its own atomic transaction. Idempotent. */
+  private async persistResource(
+    resource: Parameters<IStorageEngine['saveResource']>[0],
+  ): Promise<void> {
+    const tx = await this.storage.beginTransaction();
+    await this.storage.saveResource(resource, tx);
+    await tx.commit();
   }
 
   private async sendToTab(tabId: number, message: unknown): Promise<NavResponse> {

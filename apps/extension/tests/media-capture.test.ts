@@ -7,6 +7,9 @@ import {
   type ICaptureResponse,
 } from '../src/background/media-capture.js';
 
+/** The pinned crawl tab id threaded into every hydrate call (RCA-8). */
+const TEST_TAB_ID = 42;
+
 // ---- Builders --------------------------------------------------------------
 
 function makeMedia(id: string, overrides: Partial<IMedia> = {}): IMedia {
@@ -67,7 +70,7 @@ describe('MediaCaptureCoordinator — success path', () => {
     });
     const coordinator = new MediaCaptureCoordinator(transport, store);
 
-    const outcome = await coordinator.hydrate(resource);
+    const outcome = await coordinator.hydrate(resource, TEST_TAB_ID);
 
     expect(outcome.persisted).toBe(2);
     expect(outcome.failures).toHaveLength(0);
@@ -93,7 +96,7 @@ describe('MediaCaptureCoordinator — partial / total failure', () => {
     });
     const coordinator = new MediaCaptureCoordinator(transport, store);
 
-    const outcome = await coordinator.hydrate(resource);
+    const outcome = await coordinator.hydrate(resource, TEST_TAB_ID);
 
     expect(outcome.persisted).toBe(1);
     expect(outcome.failures).toHaveLength(1);
@@ -114,7 +117,7 @@ describe('MediaCaptureCoordinator — partial / total failure', () => {
     });
     const coordinator = new MediaCaptureCoordinator(transport, store);
 
-    const outcome = await coordinator.hydrate(resource);
+    const outcome = await coordinator.hydrate(resource, TEST_TAB_ID);
 
     expect(outcome.persisted).toBe(0);
     expect(outcome.failures).toHaveLength(1);
@@ -138,7 +141,7 @@ describe('MediaCaptureCoordinator — skip rules', () => {
     });
     const coordinator = new MediaCaptureCoordinator(transport, store);
 
-    const outcome = await coordinator.hydrate(resource);
+    const outcome = await coordinator.hydrate(resource, TEST_TAB_ID);
 
     expect(outcome.persisted).toBe(1);
     expect(outcome.skipped).toBe(1);
@@ -161,7 +164,7 @@ describe('MediaCaptureCoordinator — skip rules', () => {
     const resource = makeResource('r5', []);
     const coordinator = new MediaCaptureCoordinator(transport, store);
 
-    const outcome = await coordinator.hydrate(resource);
+    const outcome = await coordinator.hydrate(resource, TEST_TAB_ID);
 
     expect(called).toBe(0);
     expect(outcome.persisted).toBe(0);
@@ -182,7 +185,7 @@ describe('MediaCaptureCoordinator — skip rules', () => {
     };
     const coordinator = new MediaCaptureCoordinator(transport, store);
 
-    const outcome = await coordinator.hydrate(resource);
+    const outcome = await coordinator.hydrate(resource, TEST_TAB_ID);
 
     expect(called).toBe(0);
     expect(outcome.skipped).toBe(1);
@@ -216,7 +219,7 @@ describe('MediaCaptureCoordinator — carousels (children)', () => {
     };
     const coordinator = new MediaCaptureCoordinator(transport, store);
 
-    const outcome = await coordinator.hydrate(parent);
+    const outcome = await coordinator.hydrate(parent, TEST_TAB_ID);
 
     expect(calls).toBe(3); // one transport call per node with fetchable media
     expect(outcome.persisted).toBe(3);
@@ -259,7 +262,7 @@ describe('MediaCaptureCoordinator — carousels (children)', () => {
     };
     const coordinator = new MediaCaptureCoordinator(transport, store);
 
-    await coordinator.hydrate(parent);
+    await coordinator.hydrate(parent, TEST_TAB_ID);
 
     expect(parent.state).toBe(ResourceState.EXTRACTED);
     expect(parent.children?.[0].state).toBe(ResourceState.EXTRACTED);
@@ -279,11 +282,11 @@ describe('MediaCaptureCoordinator — idempotency on retry', () => {
     });
     const coordinator = new MediaCaptureCoordinator(transport, store);
 
-    await coordinator.hydrate(resource);
+    await coordinator.hydrate(resource, TEST_TAB_ID);
     const first = await store.list();
 
     // Retry: identical inputs.
-    await coordinator.hydrate(resource);
+    await coordinator.hydrate(resource, TEST_TAB_ID);
     const second = await store.list();
 
     expect(second).toHaveLength(first.length);
@@ -312,7 +315,7 @@ describe('MediaCaptureCoordinator — size guard', () => {
     });
     const coordinator = new MediaCaptureCoordinator(transport, store);
 
-    const outcome = await coordinator.hydrate(resource);
+    const outcome = await coordinator.hydrate(resource, TEST_TAB_ID);
 
     expect(outcome.persisted).toBe(0);
     expect(outcome.failures).toHaveLength(1);

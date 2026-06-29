@@ -28,6 +28,7 @@ import { ExportWriter } from './export/writer.js';
 import { ChromeDownloadGateway } from './export/download-gateway.js';
 import { createSerializerRegistry } from './export/registry.js';
 import { MediaJanitor } from './media-janitor.js';
+import { SmokeHarness } from './smoke-harness.js';
 import { InstagramConnector } from '@knowledge-extractor/connector-instagram';
 import {
   IndexedDbStorageEngine,
@@ -110,14 +111,15 @@ if (!OpfsBlobBackend.isSupported()) {
  * on the small `ICaptureTransport` interface; this is its sole production impl.
  */
 const captureTransport: ICaptureTransport = {
-  async capture(items) {
-    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-    const tabId = tabs[0]?.id;
+  async capture(items, tabId) {
+    // The controller pins exactly one Instagram tab per crawl and threads its
+    // id here (RCA-8). No ambient `chrome.tabs.query` — capture always targets
+    // the same authenticated tab the rest of the pipeline drives.
     if (typeof tabId !== 'number') {
       return {
         success: false,
         captured: [],
-        failed: items.map((i) => ({ id: i.id, error: 'No active tab' })),
+        failed: items.map((i) => ({ id: i.id, error: 'No pinned tab' })),
       };
     }
     return (await chrome.tabs.sendMessage(tabId, {
@@ -137,6 +139,13 @@ const controller = new CrawlController(
   mediaStore,
   mediaCapture,
 );
+
+// Live-run smoke harness (P3). Dev-triggered via the RUN_SMOKE message; drives
+// the real controller + metrics and reports an objective PASS/FAIL per surface.
+const smokeHarness = new SmokeHarness(controller, metrics, async () => {
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tabs[0]?.url ?? '';
+});
 
 // OCR engine and enrichment loop: only available when IndexedDB is present.
 // OcrEngine manages the offscreen document lifecycle; EnrichmentLoop calls its
@@ -287,7 +296,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     controller
       .startCrawl()
       .then((session) => sendResponse({ success: true, session }))
-      .catch(() => sendResponse({ success: false }));
+      // Forward the reason so the popup can surface "open an Instagram tab
+      // first" instead of a silent failure (tab pinning, RCA-8).
+      .catch((err: unknown) =>
+        sendResponse({ success: false, error: err instanceof Error ? err.message : String(err) }),
+      );
     return true;
   }
 
@@ -309,6 +322,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.action === 'GET_SESSION') {
     sendResponse(controller.getSession());
     return false;
+  }
+
+  // Live-run smoke harness (P3): runs one bounded crawl on the active surface
+  // and replies with an objective PASS/FAIL report. Dev/QA trigger only.
+  if (message.action === 'RUN_SMOKE') {
+    smokeHarness
+      .run((message.data as { timeoutMs?: number; pollMs?: number } | undefined) ?? {})
+      .then((report) => sendResponse(report))
+      .catch((err: unknown) =>
+        sendResponse({ pass: false, error: err instanceof Error ? err.message : String(err) }),
+      );
+    return true;
   }
 
   if (message.action === 'RESOURCES_DISCOVERED') {

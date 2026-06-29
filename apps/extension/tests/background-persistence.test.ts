@@ -114,6 +114,21 @@ describe('SessionManager — durable persistence (IControlStateStore)', () => {
     expect(snap.extracted).toBe(1);
     expect(snap.persisted).toBe(1);
   });
+
+  it('persists the pinned tab id and restores it across restart (RCA-8)', async () => {
+    const store = new TestControlStateStore();
+    const first = new SessionManager(new MetricsCollector(), store);
+    await first.init();
+    first.startNewSession();
+    // CrawlController.startCrawl pins the active Instagram tab here.
+    await first.update({ tabId: 1234 });
+
+    // Fresh manager over the same durable store = service-worker revival.
+    const second = new SessionManager(new MetricsCollector(), store);
+    await second.init();
+
+    expect(second.getSession()?.tabId).toBe(1234);
+  });
 });
 
 describe('DiagnosticsCollector — snapshot / hydrate', () => {
