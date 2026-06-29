@@ -209,6 +209,12 @@ export class ExportCoordinator {
     const manifest = request.incremental === true ? await this._loadManifest(request.target) : null;
     const watermark = manifest?.lastExportedAt ?? null;
 
+    // [EXPORT-DIAG] One-off instrumentation: the selection filter for this run.
+    this.logger.info(
+      `[EXPORT-DIAG] start: target=${request.target} stateFilter=${request.state ?? 'ALL'} ` +
+        `incremental=${request.incremental === true} watermark=${watermark ?? 'none'}`,
+    );
+
     // Persist the request so a watchdog resume after SW eviction can reconstruct
     // it (IExportProgress alone does not carry state/inclusion).
     await this.controlStore.saveCrawlState(REQUEST_KEY, request);
@@ -223,10 +229,14 @@ export class ExportCoordinator {
 
     do {
       const page = await this.queryable.queryResources({
-        state: request.state,
         pageSize: PAGE_SIZE,
+        // Omit `state` entirely when unset so storage enumerates ALL states.
+        ...(request.state !== undefined ? { state: request.state } : {}),
         ...(cursor !== undefined ? { cursor } : {}),
       });
+
+      // [EXPORT-DIAG] One-off instrumentation: resources returned per page.
+      this.logger.info(`[EXPORT-DIAG] page: items=${page.items.length} hasMore=${page.hasMore}`);
 
       for (const resource of page.items) {
         // Per-item isolation: one bad resource must never abort the export.
@@ -305,6 +315,12 @@ export class ExportCoordinator {
     // Assemble + deliver the artifact. The writer resolves binary bytes here.
     const filename = buildFilename(request.target, mode);
     const written = await this.writer.finalize(mode, filename);
+
+    // [EXPORT-DIAG] One-off instrumentation: the delivered artifact.
+    this.logger.info(
+      `[EXPORT-DIAG] finalized: file=${filename} bytes=${written.bytes} ` +
+        `resourcesWritten=${resourcesWritten} mediaWritten=${mediaQueued} skipped=${resourcesSkipped}`,
+    );
 
     // Update the manifest only after a successful, non-cancelled completion.
     if (request.incremental === true) {

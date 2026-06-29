@@ -31,6 +31,11 @@ Alpha Validation against live Instagram — fixing the navigation/extraction fou
 None.
 
 ## Recent Engineering Changes
+- **Export 0-byte fix (state-filter mismatch):** Export queried resources by a single lifecycle state hard-coded to `ENRICHED` (`popup/index.tsx`), but resources persist as `EXTRACTED`/`HYDRATED` and only reach `ENRICHED` via OCR — which is dead (missing `eng.traineddata`). The `by_state` index lookup matched 0 of 20, so the artifact was empty.
+  - **Fix:** `IResourceQuery.state` and `IExportRequest.state` are now optional; when omitted, `IndexedDbStorageEngine.queryResources` enumerates the whole store by primary key (new `queryByKey` helper) so export captures **all** persisted knowledge regardless of state. Popup sends no `state` filter.
+  - **Instrumentation (labeled `[EXPORT-DIAG]`, removable):** START_EXPORT logs total IDB resources + state breakdown; coordinator logs per-page item count and final artifact bytes/filename.
+  - Tests: storage `queryResources` no-state enumeration + primary-key pagination. Gates green (storage 54; depcruise 144 modules, 0 violations).
+  - Note: this is independent of the OCR-asset gap (`eng.traineddata`), which still blocks `ENRICHED` promotion but no longer blocks export.
 - **Navigation Redesign — P3 (Validation infrastructure):**
   - **In-extension `SmokeHarness`** (`apps/extension/src/background/smoke-harness.ts`): dev-triggered via the `RUN_SMOKE` message, runs one bounded crawl on the active surface, polls metrics, stops, and returns a structured PASS/FAIL `ISmokeReport` (per-assertion discovered/extracted/persisted > 0). Pure orchestration over injected crawl/metrics seams — no Chrome APIs inside, fully unit-tested.
   - **Automated smoke gates:** `tests/smoke.test.ts` (real extract → normalize → persist; carousel multi-slide) and `tests/smoke-harness.test.ts` (pass/timeout/partial-failure).

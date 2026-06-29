@@ -343,6 +343,40 @@ describe('IndexedDbStorageEngine — queryResources: state filtering', () => {
   });
 });
 
+describe('IndexedDbStorageEngine — queryResources: no state filter (export-all)', () => {
+  it('returns resources across ALL lifecycle states when state is omitted', async () => {
+    const engine = new IndexedDbStorageEngine(uniqueDbName());
+    await engine.saveResource(makeResource('x1', { state: ResourceState.EXTRACTED }));
+    await engine.saveResource(makeResource('h1', { state: ResourceState.HYDRATED }));
+    await engine.saveResource(makeResource('n1', { state: ResourceState.ENRICHED }));
+
+    // No `state` ⇒ enumerate everything (the export-all path). A single-state
+    // filter (the old ENRICHED-only export) would have returned just one.
+    const all = await engine.queryResources({ pageSize: 20 });
+    expect(all.items).toHaveLength(3);
+    expect(all.items.map((r) => r.id).sort()).toEqual(['h1', 'n1', 'x1']);
+    expect(all.hasMore).toBe(false);
+    await engine.close();
+  });
+
+  it('paginates the whole store by primary key when state is omitted', async () => {
+    const engine = new IndexedDbStorageEngine(uniqueDbName());
+    for (const id of ['a', 'b', 'c', 'd', 'e']) {
+      await engine.saveResource(makeResource(id, { state: ResourceState.EXTRACTED }));
+    }
+
+    const page1 = await engine.queryResources({ pageSize: 3 });
+    expect(page1.items).toHaveLength(3);
+    expect(page1.hasMore).toBe(true);
+    expect(page1.nextCursor).toBe('c');
+
+    const page2 = await engine.queryResources({ pageSize: 3, cursor: page1.nextCursor! });
+    expect(page2.items.map((r) => r.id)).toEqual(['d', 'e']);
+    expect(page2.hasMore).toBe(false);
+    await engine.close();
+  });
+});
+
 describe('IndexedDbStorageEngine — queryResources: multiple pages', () => {
   it('paginates correctly across two pages', async () => {
     const engine = new IndexedDbStorageEngine(uniqueDbName());

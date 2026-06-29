@@ -356,6 +356,19 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       sendResponse({ accepted: false, reason: 'Export unavailable: no durable storage' });
       return false;
     }
+    // [EXPORT-DIAG] One-off instrumentation: ground-truth count of resources in
+    // IndexedDB and their lifecycle-state breakdown, so the export's resource
+    // count can be compared against what is actually persisted.
+    idbEngine
+      ?.listResources()
+      .then((all) => {
+        const byState = all.reduce<Record<string, number>>((acc, r) => {
+          acc[r.state] = (acc[r.state] ?? 0) + 1;
+          return acc;
+        }, {});
+        logger.info(`[EXPORT-DIAG] IndexedDB resources: total=${all.length}`, byState);
+      })
+      .catch((err) => logger.warn('[EXPORT-DIAG] listResources failed', err));
     sendResponse(exportCoordinator.start(message.data as IExportRequest));
     return false;
   }

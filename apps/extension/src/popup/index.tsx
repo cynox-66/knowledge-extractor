@@ -7,7 +7,7 @@ import type {
   IExportRequest,
   MediaInclusion,
 } from '@knowledge-extractor/types';
-import { ExportTarget, ResourceState } from '@knowledge-extractor/types';
+import { ExportTarget } from '@knowledge-extractor/types';
 
 /**
  * Export control panel (Beta-3 M4). Lets the user pick a target + media policy,
@@ -45,7 +45,10 @@ const ExportPanel = () => {
 
   const startExport = () => {
     setNotice(null);
-    const request: IExportRequest = { target, state: ResourceState.ENRICHED, media };
+    // Export ALL persisted resources (no lifecycle-state filter). Resources span
+    // EXTRACTED/HYDRATED/ENRICHED — filtering by a single state (previously
+    // ENRICHED, which OCR never reaches) dropped everything from the export.
+    const request: IExportRequest = { target, media };
     chrome.runtime.sendMessage(
       { action: 'START_EXPORT', data: request },
       (resp: { accepted: boolean; reason?: string }) => {

@@ -8,8 +8,13 @@ import { IResource, ResourceState } from '../core/resource.js';
  * `cursor` returned by the previous page to advance through the result set.
  */
 export interface IResourceQuery {
-  /** Return only resources currently in this lifecycle state. */
-  state: ResourceState;
+  /**
+   * Return only resources currently in this lifecycle state. Omit to enumerate
+   * resources in **every** state (paginated by primary key) — required for
+   * exporting all persisted knowledge, which legitimately spans EXTRACTED,
+   * HYDRATED, and ENRICHED.
+   */
+  state?: ResourceState;
   /**
    * Maximum number of resources to return per page.
    * Callers must keep this small enough that the background worker does not

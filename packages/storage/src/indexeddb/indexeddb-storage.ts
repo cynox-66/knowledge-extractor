@@ -17,6 +17,7 @@ import {
   writeRecord,
   deleteRecord,
   queryByIndex,
+  queryByKey,
 } from './database.js';
 import { STORES, RESOURCE_STATE_INDEX } from './schema.js';
 import { BufferedTransaction } from './transaction.js';
@@ -108,6 +109,12 @@ export class IndexedDbStorageEngine
 
   async queryResources(query: IResourceQuery): Promise<IEnrichmentSelection> {
     const db = await this.db();
+    // No state filter ⇒ enumerate the whole store by primary key. With a state
+    // filter ⇒ use the `by_state` index. Exporting all knowledge omits `state`,
+    // which spans EXTRACTED/HYDRATED/ENRICHED; enrichment queries pass a state.
+    if (query.state === undefined) {
+      return queryByKey<IResource>(db, STORES.RESOURCES, query.pageSize, query.cursor);
+    }
     return queryByIndex<IResource>(
       db,
       STORES.RESOURCES,

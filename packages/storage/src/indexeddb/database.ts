@@ -145,6 +145,50 @@ export async function deleteRecord(
  *
  * @param T  Record type; must expose an `id: string` primary key field.
  */
+/**
+ * Paginates an entire object store by primary key — the state-agnostic
+ * counterpart to {@link queryByIndex}. Returns one page in primary-key order,
+ * starting strictly after `afterId` when supplied. Used to enumerate resources
+ * across all lifecycle states (e.g. exporting everything persisted).
+ *
+ * @param T  Record type; must expose an `id: string` primary key field.
+ */
+export function queryByKey<T extends { id: string }>(
+  db: IDBDatabase,
+  store: StoreName,
+  pageSize: number,
+  afterId?: string,
+): Promise<{ items: T[]; nextCursor?: string; hasMore: boolean }> {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readonly');
+    // Start strictly after the previous page's last key (exclusive lower bound).
+    const range = afterId !== undefined ? IDBKeyRange.lowerBound(afterId, true) : undefined;
+    const req = tx.objectStore(store).openCursor(range);
+
+    const items: T[] = [];
+    let done = false;
+
+    req.onsuccess = () => {
+      if (done) return;
+      const cursor = req.result;
+      if (!cursor) {
+        resolve({ items, hasMore: false });
+        return;
+      }
+      if (items.length < pageSize) {
+        items.push(cursor.value as T);
+        cursor.continue();
+      } else {
+        // Cursor sits on the (pageSize + 1)-th record → more pages remain.
+        resolve({ items, nextCursor: items[items.length - 1].id, hasMore: true });
+        done = true;
+      }
+    };
+
+    req.onerror = () => reject(req.error ?? new Error('Key cursor query failed'));
+  });
+}
+
 export function queryByIndex<T extends { id: string }>(
   db: IDBDatabase,
   store: StoreName,

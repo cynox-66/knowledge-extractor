@@ -63,7 +63,8 @@ export interface ISerializer {
 /** A user-initiated export request. Selection is by lifecycle state in Beta-3. */
 export interface IExportRequest {
   target: ExportTarget;
-  state: ResourceState; // e.g. ENRICHED
+  /** Lifecycle-state filter. Omit to export ALL persisted resources (default). */
+  state?: ResourceState;
   media: MediaInclusion;
   /**
    * When true, only export resources whose {@link IResource.source.extractedAt}
