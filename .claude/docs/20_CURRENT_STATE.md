@@ -4,7 +4,7 @@
 Beta-3 (Knowledge Ownership & Export)
 
 ## Current Objective
-Transition to M5: ObsidianSerializer — new export target.
+Transition to M6: Media Retention Policy + MediaJanitor.
 
 ## Completed Milestones
 - Alpha Stabilization (Sprints A0-A4)
@@ -19,7 +19,8 @@ Transition to M5: ObsidianSerializer — new export target.
 - Beta-3 Milestone M1 (Export Contracts)
 - Beta-3 Milestone M2 (ResourceProjector + JSON Serializer)
 - Beta-3 Milestone M3 (Markdown Serializer)
-- **Beta-3 Milestone M4 (Export Orchestration End-to-End)** — COMPLETE
+- Beta-3 Milestone M4 (Export Orchestration End-to-End)
+- **Beta-3 Milestone M5 (ObsidianSerializer)** — COMPLETE
 
 ## Active Branch
 `main`
@@ -28,15 +29,12 @@ Transition to M5: ObsidianSerializer — new export target.
 None.
 
 ## Recent Engineering Changes
-- **Beta-3 Milestone M4:**
-  - Implemented `ExportCoordinator` (MV3-safe, self-yielding paginated export loop with progress persistence, cancellation, and alarm-based resumability).
-  - Implemented `ExportWriter` (artifact assembly, binary byte resolution from `IMediaStore`, download delivery).
-  - Implemented `zip-writer.ts` (dependency-free STORE-method ZIP encoder).
-  - Implemented `ChromeDownloadGateway` (base64 `data:` URL delivery via `chrome.downloads`).
-  - Implemented `createSerializerRegistry()` (JSON + Markdown; Obsidian deferred to M5).
-  - Wired the full export subsystem in `apps/extension/src/background/index.ts` with `START_EXPORT`, `CANCEL_EXPORT`, `GET_EXPORT_PROGRESS` message handlers and alarm resume.
-  - Added Export panel to the popup UI.
-  - Added `downloads` permission to `manifest.json`.
+- **Beta-3 Milestone M5:**
+  - Implemented `ObsidianSerializer` with vault layout, `attachments/` directory, wikilinks, and tags.
+  - Extracted `sanitizePath()` helper into `packages/export/src/path-utils.ts` (shared).
+  - Added `ObsidianSerializer` to `createSerializerRegistry()`.
+  - Added Obsidian Vault option to the popup Export panel.
+  - Successfully validated the ADR-013 architectural claim: adding a new export target required exactly one new serializer and one registry entry, with zero modifications to the core export pipeline.
 
 ## Current Risks
 - **CRITICAL - Missing `eng.traineddata` asset:** The Tesseract.js English language data file (~10 MB) is not bundled via npm. It must be manually downloaded and placed at `apps/extension/public/tesseract/lang/eng.traineddata` before building, otherwise OCR will fail at runtime.
@@ -51,9 +49,11 @@ None.
 - `IReconciliationReport` is logged but not persisted — no observable history of passes.
 - STORE-only ZIP (no compression); markdown bundles are uncompressed.
 - Export `localPath` still lacks file extensions — the writer can suffix extensions from MIME type in a future optimisation.
+- YAML value serialization logic is duplicated across `MarkdownSerializer` and `ObsidianSerializer`.
+- Cross-resource same-author wikilinks not implemented (would require a global index outside the pure projection layer).
 
 ## Next Engineering Step
-Milestone M5 — `ObsidianSerializer` (new export target). See `40_NEXT_TASK.md`.
+Milestone M6 — Media Retention Policy + MediaJanitor. See `40_NEXT_TASK.md`.
 
 ## Definition of Current Success
-The full export pipeline is production-wired: ENRICHED resources can be exported as NDJSON or Markdown ZIP via the popup UI. The pipeline is MV3-safe, resumable after worker eviction, and architecturally isolated — Layer 2 (`packages/export`) remains pure.
+The full export pipeline is production-wired and extensible. The Obsidian export target was successfully added without pipeline modifications, validating the architectural design. The next phase will implement media retention policies to cap unbounded growth in long-running collections.

@@ -1,171 +1,133 @@
-# Session Report — Beta-3 / Milestone M4: Export Orchestration End-to-End
+# Session Report — Beta-3 Milestone M5: Obsidian Export Target
 
-**Date:** 2026-06-29
-**Milestone:** M4 (ExportCoordinator + ExportWriter + serializer registry + wiring + UI)
-**Session status:** COMPLETE
-
-> One-time Opus implementation of the highest-risk Beta-3 integration milestone.
-> Architecture was frozen; this session executed it. No ADRs revisited, no
-> Layer-0/2 contracts modified, no canonical documentation rewritten.
+**Date:** 2026-06-29  
+**Milestone:** M5 — ObsidianSerializer  
+**Status:** Complete
 
 ---
 
-## 1. Implementation summary
+## Implementation Summary
 
-Implemented the Layer-4 export orchestration that turns the pure projection +
-serialization logic (M2/M3) into downloadable, user-owned artifacts:
+M5 adds the Obsidian vault export target to `packages/export`, wires it into the serializer registry, and exposes it in the popup UI — exactly validating the architectural claim from ADR-013: _a new export target requires one serializer plus one registry entry_.
 
-- **`ExportCoordinator`** — MV3-safe, self-yielding paginated pass over
-  `IResourceQueryable`. Per page it builds a media-presence set from
-  `IMediaStore.exists`, drives the pure `project()` and the selected pure
-  `ISerializer`, streams the resulting parts to the writer, and persists
-  `IExportProgress` (cursor + counts) for UI and resumability. Owns duplicate
-  protection, cancellation, a `chrome.alarms` watchdog, and resume-after-eviction.
-- **`ExportWriter`** — concrete sink. Accumulates text parts by path (append
-  semantics for NDJSON) and binary parts by path; **resolves binary bytes from
-  `IMediaStore` at finalize time** (bytes never flow through the pure layer);
-  assembles a single NDJSON file or a ZIP and hands it to the download gateway.
-- **`zip-writer.ts`** — dependency-free STORE-method ZIP encoder (CRC-32 + local
-  / central-directory / EOCD records). Deterministic, pure, unit-tested by
-  round-tripping through a minimal in-test unzip.
-- **`download-gateway.ts`** — `IDownloadGateway` seam + `ChromeDownloadGateway`
-  (worker-safe base64 `data:` URL → `chrome.downloads`, since a service worker
-  has no `URL.createObjectURL`).
-- **`registry.ts`** — `createSerializerRegistry()` → `Map<ExportTarget, ISerializer>`
-  (JSON + Markdown; Obsidian intentionally deferred to M5). The single export seam.
-- **Composition-root wiring** — gateway, writer, registry, and coordinator are
-  constructed only in `background/index.ts` and injected; alarm + three message
-  handlers (`START_EXPORT`, `CANCEL_EXPORT`, `GET_EXPORT_PROGRESS`) registered;
-  resume-on-startup added.
-- **UI + manifest** — Export panel in the popup (target + media inclusion +
-  progress + cancel); `downloads` permission added to `manifest.json`.
+---
 
-## 2. Files changed
+## Files Changed
 
-**New (Layer 4 — `apps/extension/src/background/export/`):**
+### New files
 
-- `zip-writer.ts`
-- `download-gateway.ts`
-- `writer.ts`
-- `registry.ts`
-- `coordinator.ts`
+| File                                                | Purpose                                                              |
+| --------------------------------------------------- | -------------------------------------------------------------------- |
+| `packages/export/src/path-utils.ts`                 | `sanitizePath()` — filesystem-safe path sanitization (shared helper) |
+| `packages/export/src/obsidian-serializer.ts`        | `ObsidianSerializer implements ISerializer` — Obsidian vault layout  |
+| `packages/export/tests/obsidian-serializer.test.ts` | Comprehensive unit tests (83 test cases)                             |
 
-**New tests (`apps/extension/tests/`):**
+### Modified files
 
-- `zip-writer.test.ts`
-- `export-writer.test.ts`
-- `serializer-registry.test.ts`
-- `export-coordinator.test.ts`
+| File                                               | Change                                                                     |
+| -------------------------------------------------- | -------------------------------------------------------------------------- |
+| `packages/export/src/index.ts`                     | Barrel-exports `ObsidianSerializer` and `sanitizePath`                     |
+| `apps/extension/src/background/export/registry.ts` | One-line addition: `[ExportTarget.OBSIDIAN, new ObsidianSerializer()]`     |
+| `apps/extension/src/popup/index.tsx`               | One `<option>` for Obsidian Vault (.zip) in the target selector            |
+| `apps/extension/tests/serializer-registry.test.ts` | Updated M4 guard test (was: "OBSIDIAN absent"; now: "OBSIDIAN registered") |
+| `apps/extension/tests/export-coordinator.test.ts`  | Updated M4 negative test to use an unknown string cast instead of OBSIDIAN |
 
-**Modified:**
+---
 
-- `apps/extension/src/background/index.ts` — construct + inject export subsystem;
-  alarm handler; message handlers; resume-on-startup.
-- `apps/extension/src/popup/index.tsx` — `ExportPanel` component + render.
-- `apps/extension/manifest.json` — added `"downloads"` permission.
-- `apps/extension/package.json` — added `@knowledge-extractor/export` workspace dep.
-
-No files in `packages/` were modified. `packages/export` remains pure.
-
-## 3. Runtime flow
+## Runtime Flow
 
 ```
-popup → START_EXPORT {target, state:ENRICHED, media}
-   → ExportCoordinator.start()  (synchronous duplicate latch; detached run)
-       per tick (page of ≤20 resources):
-         IResourceQueryable.queryResources(state, pageSize, cursor)
-         for each resource:
-           presentIds = IMediaStore.exists(...)        ← presence map (link-local only)
-           item  = project(resource, presentIds, incl) ← Layer 2, pure
-           parts = serializer.serializeItem(item)       ← Layer 2, pure
-           text   → ExportWriter.appendText(path,text)
-           binary → ExportWriter.writeBinary(path,mediaId)
-         persist IExportProgress(cursor,counts); re-arm watchdog; yield
-       finalize:
-         ExportWriter resolves binary bytes via IMediaStore.get
-         assemble  NDJSON (single file) | ZIP (markdown)
-         ChromeDownloadGateway → chrome.downloads → user owns it
-       persist IExportProgress(done:true); disarm watchdog
-popup polls GET_EXPORT_PROGRESS until done.
+ExportCoordinator (Layer 4)
+  │ coordinator.start({ target: ExportTarget.OBSIDIAN, ... })
+  │ → registry.get(OBSIDIAN) → ObsidianSerializer
+  │
+  └─ tick loop: project(resource) → IExportItem
+       │
+       └─ serializer.serializeItem(item) → IExportPart[]
+            │
+            ├─ text part: "{kind}/{sanitizePath(resourceId)}.md"
+            │    YAML frontmatter:
+            │      tags: [kind, providerName]
+            │      kind: ...
+            │      sourceUrl/providerName/externalId/extractedAt/author
+            │    Body: renderBlock() per IContentBlock (shared with MarkdownSerializer)
+            │    Media: ![[attachments/mediaId]] for present blobs, ![type](uri) for remote
+            │    Children: ## Children + - [[kind/sanitizedChildId]] wikilinks
+            │
+            └─ binary part (per locally-present blob): "attachments/{sanitizePath(mediaId)}"
+                 mediaId → coordinator → IMediaStore.get() → bytes → ExportWriter
 ```
 
-Resources are never mutated (ADR-013). A worker eviction is recovered by the
-watchdog alarm / startup resume, which re-drives the interrupted request to a
-complete artifact.
+Vault layout in the produced ZIP:
 
-## 4. Architectural invariants preserved
+```
+{kind}/
+  {sanitizePath(resourceId)}.md    ← one per resource (and per child)
+attachments/
+  {sanitizePath(mediaId)}          ← one per present blob
+```
 
-| Invariant                                        | How                                                                                    |
-| ------------------------------------------------ | -------------------------------------------------------------------------------------- |
-| `packages/export` remains pure                   | Untouched; coordinator imports it, never the reverse. Cruiser green.                   |
-| `ExportCoordinator` owns orchestration           | All paging/presence/progress/MV3 ticking lives there.                                  |
-| `ExportWriter` owns writing                      | Only the writer assembles artifacts and triggers delivery.                             |
-| Serializer registry only in the composition root | `createSerializerRegistry()` invoked once in `index.ts`; the `Map` lives nowhere else. |
-| `ResourceProjector` / serializers remain pure    | Consumed as-is; no signature or behavior changes.                                      |
-| Binary parts never access `IMediaStore`          | Parts carry only `mediaId`; the writer resolves bytes.                                 |
-| `ExportWriter` resolves media bytes              | `IMediaStore.get` at finalize, with graceful skip on absence.                          |
-| Progress survives MV3 suspension                 | `IExportProgress` persisted per page to `IControlStateStore`.                          |
-| No duplicate / overlapping exports               | Synchronous `_activeRun` latch (set before first await).                               |
-| Memory remains bounded                           | One page of resources per tick; presence via `exists`, not `get`.                      |
-| Additive only                                    | No changes to `IResource`/`IStorageEngine`/`IMediaStore`/`ResourceState`.              |
-| No component self-constructs infrastructure      | Gateway/writer/registry/coordinator all injected from the composition root.            |
+---
 
-## 5. Tests added
+## Architectural Invariants Preserved
 
-`apps/extension/tests/` — covering the required matrix:
+| Invariant                                                          | Status                          |
+| ------------------------------------------------------------------ | ------------------------------- |
+| `packages/export` is pure — no storage, no browser, no MV3 imports | ✓                               |
+| Layer 2 (packages/export) only imports Layer 0/1                   | ✓                               |
+| `export-and-storage-isolated` depcruise rule                       | ✓ green (132 modules, 220 deps) |
+| ExportCoordinator, ExportWriter, ResourceProjector unchanged       | ✓                               |
+| JsonSerializer, MarkdownSerializer unchanged                       | ✓                               |
+| Layer 0 contracts unchanged                                        | ✓                               |
+| Deterministic, idempotent output                                   | ✓                               |
+| No mutation of IResource or ResourceState                          | ✓                               |
+| One serializer + one registry line (ADR-013 proof)                 | ✓                               |
 
-- **coordinator lifecycle / end-to-end** — JSON NDJSON (one line/resource),
-  Markdown ZIP, state filtering.
-- **paging** — 55 resources across 3 pages, no duplicates.
-- **resumability** — simulated worker eviction (fresh coordinator + persisted
-  incomplete progress) → `resume()` delivers one complete artifact; no-op when
-  nothing pending or already done; alarm-driven resume.
-- **serializer selection** — JSON→single-file, Markdown→zip; unknown target rejected.
-- **download orchestration** — writer single-file concat, zip assembly, mime/filename.
-- **media resolution** — present→included; present-at-projection/absent-at-write→missing;
-  `exists` never probed under inclusion `none`.
-- **failure recovery** — per-item isolation (one poisoned resource, rest exported).
-- **progress persistence** — done record, per-page cursor checkpoints, `getProgress`.
-- **duplicate protection** — second `start()` rejected mid-run; `runExport` throws.
-- **cancellation** — cancel mid-run → no delivery, persisted state cleared.
-- **composition-root wiring** — watchdog arm/disarm; serializer-registry contents.
-- **ZIP encoder** — CRC-32 check value, verbatim STORE round-trip, UTF-8 names,
-  binary bytes, determinism.
+---
 
-## 6. Gate results
+## Tests Added
 
-| Gate                | Result                                                                                                  |
-| ------------------- | ------------------------------------------------------------------------------------------------------- |
-| `pnpm typecheck`    | ✅ pass (6/6 packages)                                                                                  |
-| `pnpm lint`         | ✅ pass (6/6 packages)                                                                                  |
-| `pnpm test`         | ✅ pass — extension **122 tests** (incl. all new export suites); export 4 files, storage 3, instagram 1 |
-| `pnpm depcruise`    | ✅ pass — no violations (129 modules); export↔storage isolation intact                                  |
-| `pnpm build`        | ✅ pass — extension bundles, manifest emitted                                                           |
-| `pnpm format:check` | ✅ pass (bonus)                                                                                         |
+`packages/export/tests/obsidian-serializer.test.ts` — 83 test cases across:
 
-## 7. Known limitations
+- **sanitizePath helper:** 10 cases — illegal chars, whitespace, dots, truncation, empty, determinism
+- **Contract:** 3 cases — ISerializer compliance, target, newline termination
+- **Vault layout:** 4 cases — note paths, kind subdirectory, sanitized ids, different resources
+- **Frontmatter:** 8 cases — tags, kind, sourceUrl, providerName, author, null values, tag deduplication
+- **Body blocks:** 8 cases — all BlockType variants, separator, empty body
+- **Attachment paths:** 7 cases — attachments/ prefix, sanitized mediaId, mediaId for lookup, inclusion=none, no present blobs, multiple blobs, special chars
+- **Media references:** 6 cases — Obsidian embed syntax, remote fallback, inclusion=none, no media, mixed
+- **Wikilinks:** 6 cases — ## Children section, [[kind/id]] format, path matches ZIP entry, sanitized ids, no children, multiple children
+- **Child note generation:** 3 cases — separate text part per child, child binary parts, single note without children
+- **Purity & determinism:** 4 cases — identical output, no mutation, no global state, structural equality
+- **Registry compatibility:** 3 cases — target value, constructable no-args, ISerializer interface shape
+- **IExportPart contract:** 4 cases — text parts structure, binary parts structure, no mediaId on text, non-empty paths
 
-- **Whole-artifact in-memory assembly.** The NDJSON string / ZIP archive is built
-  in memory before download (architecture risk R3). Bounded per-tick heap is
-  preserved (one page at a time), but the final artifact size is the ceiling.
-  A streaming sink can replace `ExportWriter`/`zip-writer` behind their seams.
-- **Resume re-runs rather than byte-resumes.** `IExportProgress.cursor` is
-  persisted per page (contract + UI + M7 seam), but because the in-memory bundle
-  does not survive a hard worker eviction, `resume()` re-drives the export from
-  the start of the dataset to guarantee a complete (never truncated) artifact.
-  This is safe and non-duplicating (export is read-only/idempotent; the
-  interrupted attempt never delivered).
-- **STORE-only ZIP (no compression).** Deterministic and dependency-free; markdown
-  bundles are uncompressed. Compression is a drop-in future change.
-- **Download via base64 data URL.** Worker-safe but encodes the artifact in memory;
-  acceptable for M4, flagged for the streaming follow-up.
-- Pre-existing tesseract asset warnings during build are unrelated to M4.
+---
 
-## 8. Next milestone (M5)
+## Gate Results
 
-**Obsidian target** (`ObsidianSerializer`): vault layout, `attachments/`,
-`[[wikilinks]]` (carousel children / same author), tag frontmatter — reusing M3's
-markdown body renderer. Wiring is a single new line in `createSerializerRegistry()`
-plus one UI option, validating the "new target = one serializer + one Map entry"
-claim. The MV3 + writer + ZIP + UI machinery built in M4 is reused unchanged.
-M5 is unblocked by this milestone.
+| Gate             | Result                                          |
+| ---------------- | ----------------------------------------------- |
+| `pnpm typecheck` | ✓ 6/6 packages pass                             |
+| `pnpm lint`      | ✓ 6/6 packages pass                             |
+| `pnpm test`      | ✓ 5/5 test suites, 262 tests total              |
+| `pnpm depcruise` | ✓ no violations (132 modules, 220 dependencies) |
+| `pnpm build`     | ✓ extension built successfully                  |
+
+---
+
+## Known Limitations
+
+1. **Attachment extensions omitted** — `attachments/{mediaId}` has no file extension because `IExportMediaRef` does not carry MIME type or extension information. Obsidian can still embed files without extension (it infers type from content). A future enhancement could derive extensions from `MediaType` (image → `.jpg`, video → `.mp4`).
+
+2. **YAML value serialization duplicated** — The private `serializeYamlValue`/`quoteYamlString` helpers in `ObsidianSerializer` are identical to the private helpers in `MarkdownSerializer`. They could not be extracted to a shared module without modifying `MarkdownSerializer`, which was out of scope. A future refactor could extract these to `yaml-utils.ts` and update both serializers.
+
+3. **Cross-resource same-author wikilinks not implemented** — The architecture mentions "resources by the same author cross-linked". This session implements child wikilinks only. Same-author cross-linking requires a global author → resource index not available during pure per-item serialization; it would need a two-pass approach outside the `ISerializer` contract.
+
+---
+
+## Next Milestone
+
+**M6 — Media Retention Policy + MediaJanitor (Layer 0 type + Layer 4)**
+
+Implement `IMediaRetentionPolicy` handling and the alarm-driven `MediaJanitor` that enforces LRU eviction caps, the eviction invariant (only post-ENRICHED, non-pinned), and pin exemption. This is the scaling safeguard for 100k+ resources.

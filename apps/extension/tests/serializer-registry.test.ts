@@ -9,9 +9,9 @@ describe('createSerializerRegistry', () => {
     expect(registry.get(ExportTarget.MARKDOWN)?.target).toBe(ExportTarget.MARKDOWN);
   });
 
-  it('does not register Obsidian (deferred to M5)', () => {
+  it('registers the Obsidian serializer (M5)', () => {
     const registry = createSerializerRegistry();
-    expect(registry.has(ExportTarget.OBSIDIAN)).toBe(false);
+    expect(registry.get(ExportTarget.OBSIDIAN)?.target).toBe(ExportTarget.OBSIDIAN);
   });
 
   it('each serializer reports a target matching its registry key', () => {

@@ -253,7 +253,7 @@ describe('ExportCoordinator — serializer selection', () => {
   it('rejects a target that has no registered serializer', () => {
     const { coordinator } = buildCoordinator([makeResource('r1')]);
     const start = coordinator.start({
-      target: ExportTarget.OBSIDIAN,
+      target: 'unknown-format' as ExportTarget,
       state: ResourceState.ENRICHED,
       media: 'none',
     });

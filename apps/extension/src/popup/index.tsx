@@ -89,6 +89,7 @@ const ExportPanel = () => {
         >
           <option value={ExportTarget.JSON}>JSON (NDJSON)</option>
           <option value={ExportTarget.MARKDOWN}>Markdown (.zip)</option>
+          <option value={ExportTarget.OBSIDIAN}>Obsidian Vault (.zip)</option>
         </select>
         <select
           value={media}
