@@ -1,10 +1,10 @@
 # Current State Dashboard
 
 ## Current Milestone
-Beta-2 (OCR Engine) — COMPLETE
+Beta-3 (Knowledge Ownership & Export)
 
 ## Current Objective
-Transition to Beta-3. The OCR Enrichment pipeline is now complete and fully integrated into the background worker.
+Transition to M2: Implement packages/export with JSON/NDJSON serialization.
 
 ## Completed Milestones
 - Alpha Stabilization (Sprints A0-A4)
@@ -15,7 +15,8 @@ Transition to Beta-3. The OCR Enrichment pipeline is now complete and fully inte
 - Beta-2 Phase 4A (OCR Engine)
 - Beta-2 Phase 4B (Enrichment Cursor Checkpointing)
 - Beta-2 Phase 4C (Self-rescheduling)
-- **Beta-2 Phase 4D (ENRICHED state promotion & Runtime Wiring)** — COMPLETE
+- Beta-2 Phase 4D (ENRICHED state promotion & Runtime Wiring)
+- **Beta-3 Milestone M1 (Export Contracts)** — COMPLETE
 
 ## Active Branch
 `main`
@@ -24,11 +25,10 @@ Transition to Beta-3. The OCR Enrichment pipeline is now complete and fully inte
 None.
 
 ## Recent Engineering Changes
-- **Beta-2 Phase 4D:** 
-  - Implemented ENRICHED state promotion in `EnrichmentLoop`.
-  - Added `resourcesEnriched` to `IReconciliationReport`.
-  - Integrated `idbEngine` as the `storageEngine` in `index.ts` to enable runtime promotion.
-  - Added background persistence smoke test for the runtime wiring.
+- **Beta-3 Milestone M1:** 
+  - Defined Beta-3 export contracts in `packages/types/src/export/exporter.ts`.
+  - Added `IMediaRetentionPolicy` in `packages/types/src/storage/retention.ts`.
+  - Removed deprecated `IExporter` and `ExportFormat`.
 
 ## Current Risks
 - **CRITICAL - Missing `eng.traineddata` asset:** The Tesseract.js English language data file (~10 MB) is not bundled via npm. It must be manually downloaded and placed at `apps/extension/public/tesseract/lang/eng.traineddata` before building, otherwise OCR will fail at runtime.
@@ -42,7 +42,7 @@ None.
 - `IReconciliationReport` is logged but not persisted — no observable history of passes.
 
 ## Next Engineering Step
-Define Beta-3 milestone and proceed to Phase 5 (Data Export / Downstream integration). See `40_NEXT_TASK.md`.
+Milestone M2 — `packages/export` + projector + JSON (NDJSON) serializer (Layer 2). See `40_NEXT_TASK.md`.
 
 ## Definition of Current Success
-The crawler consistently extracts and hydrates resources into IndexedDB/OPFS across a 100+ item scroll without MV3 eviction, duplicate data, or missing metrics. Enrichment reconciliation pass runs to completion via offscreen OCR document, producing transcriptions, and successfully promotes processed resources to the `ENRICHED` state. The loop automatically reschedules itself in the background and correctly resumes from its last checkpointed page after MV3 eviction.
+The extraction and enrichment pipelines are stable and self-rescheduling. The Beta-3 export contracts are locked. The next phase will implement the formatting and projection logic to prepare for file output.
