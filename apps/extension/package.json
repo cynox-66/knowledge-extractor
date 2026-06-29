@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@knowledge-extractor/connector-instagram": "workspace:*",
+    "@knowledge-extractor/export": "workspace:*",
     "@knowledge-extractor/shared": "workspace:*",
     "@knowledge-extractor/storage": "workspace:*",
     "@knowledge-extractor/types": "workspace:*",

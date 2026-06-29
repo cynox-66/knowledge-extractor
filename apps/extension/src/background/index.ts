@@ -16,11 +16,16 @@ import {
   IStorageEngine,
   IControlStateStore,
   IMediaStore,
+  IExportRequest,
 } from '@knowledge-extractor/types';
 import { CrawlController } from './crawl-controller.js';
 import { EnrichmentLoop } from './enrichment-loop.js';
 import { OcrEngine } from './ocr-engine.js';
 import { MediaCaptureCoordinator, type ICaptureTransport } from './media-capture.js';
+import { ExportCoordinator } from './export/coordinator.js';
+import { ExportWriter } from './export/writer.js';
+import { ChromeDownloadGateway } from './export/download-gateway.js';
+import { createSerializerRegistry } from './export/registry.js';
 import { InstagramConnector } from '@knowledge-extractor/connector-instagram';
 import {
   IndexedDbStorageEngine,
@@ -146,6 +151,18 @@ const enrichmentLoop =
       )
     : null;
 
+// Export subsystem (Beta-3 M4). The composition root is the only place the
+// serializer registry, writer, download gateway, and coordinator are built;
+// each receives its infrastructure by injection. The coordinator requires an
+// IResourceQueryable (paged reads) + durable control state, so — like the
+// enrichment loop — it is only available when IndexedDB is present.
+const exportWriter = new ExportWriter(mediaStore, new ChromeDownloadGateway());
+const serializerRegistry = createSerializerRegistry();
+const exportCoordinator =
+  idbEngine !== null
+    ? new ExportCoordinator(idbEngine, mediaStore, controlStore, serializerRegistry, exportWriter)
+    : null;
+
 /** Requests durable (non-evictable) storage. Best-effort; safe if unsupported. */
 async function requestPersistence(): Promise<void> {
   try {
@@ -207,6 +224,10 @@ async function startup(): Promise<void> {
   }
   await controller.init();
 
+  // Resume an export interrupted by a prior worker eviction / browser restart.
+  // Fire-and-forget: a no-op when nothing is pending.
+  exportCoordinator?.resume().catch((err) => logger.warn('Export resume failed (non-fatal)', err));
+
   // Cleanup then enrichment — sequential to prevent a race on the in-memory
   // media index (cleanup resets it; enrichment reads from it). Both remain
   // fire-and-forget from startup's perspective: neither blocks controller.init()
@@ -230,6 +251,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
   if (alarm.name === EnrichmentLoop.ALARM_NAME) {
     enrichmentLoop?.handleAlarm();
+  }
+  if (alarm.name === ExportCoordinator.ALARM_NAME) {
+    exportCoordinator?.handleAlarm();
   }
 });
 
@@ -275,6 +299,34 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message.action === 'EXPORT_DIAGNOSTICS') {
     sendResponse(controller.exportDiagnostics());
     return false;
+  }
+
+  // ---- Export orchestration (Beta-3 M4) ------------------------------------
+  if (message.action === 'START_EXPORT') {
+    if (exportCoordinator === null) {
+      sendResponse({ accepted: false, reason: 'Export unavailable: no durable storage' });
+      return false;
+    }
+    sendResponse(exportCoordinator.start(message.data as IExportRequest));
+    return false;
+  }
+
+  if (message.action === 'CANCEL_EXPORT') {
+    exportCoordinator?.cancel();
+    sendResponse({ success: true });
+    return false;
+  }
+
+  if (message.action === 'GET_EXPORT_PROGRESS') {
+    if (exportCoordinator === null) {
+      sendResponse(null);
+      return false;
+    }
+    exportCoordinator
+      .getProgress()
+      .then((progress) => sendResponse(progress))
+      .catch(() => sendResponse(null));
+    return true;
   }
 
   return false;

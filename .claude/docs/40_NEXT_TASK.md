@@ -1,40 +1,56 @@
 # Next Task
 
 ## Current Milestone
-Beta-3 (Knowledge Ownership & Export) — **Milestone M4: Export Orchestration End-to-End**
+Beta-3 (Knowledge Ownership & Export) — **Milestone M5: ObsidianSerializer**
 
 ## Current Objective
-Implement **M4**: Build the `ExportCoordinator` and `ExportWriter` to orchestrate the export process within the background worker (Layer 4).
+Implement **M5**: Add the Obsidian export target (`ObsidianSerializer`) to `packages/export` and wire it into the serializer registry.
 
 ## Why this task exists
-The pure projection and serialization logic (Layer 2) was completed in M2 and M3. Now we need to orchestrate the actual data flow: querying resources from storage, resolving media presence, running the serializers, persisting progress, and generating the final download artifact.
+M4 validated that adding a new export target is a single serializer + one registry line, with all MV3/writer/ZIP/UI machinery reused unchanged. M5 makes that claim real with the highest-differentiation target: an Obsidian-compatible vault layout with wikilinks, attachment folders, and tag frontmatter.
 
 ## Pre-conditions (must be verified at session start)
-1. Beta-3 Milestones M2 and M3 are complete and verified.
-2. `packages/export` provides `ResourceProjector`, `JsonSerializer`, and `MarkdownSerializer` as pure, storage-isolated functions.
+1. Beta-3 Milestone M4 (Export Orchestration End-to-End) is complete and verified.
+2. `packages/export` barrel exports `JsonSerializer` and `MarkdownSerializer`.
+3. `block-renderer.ts` is available and reusable (shared with M3).
 
-## Scope — Milestone M4
-- **ExportCoordinator:** Implement an MV3-safe tick loop over `IResourceQueryable`, building presence maps from `IMediaStore`, driving the projector and serializers, and persisting `IExportProgress` for resumability.
-- **ExportWriter:** Implement ZIP assembly for Markdown and single-file assembly for NDJSON, triggering `chrome.downloads`.
-- **Wiring:** Integrate a serializer registry (`Map<ExportTarget, ISerializer>`) and wire up the coordinator in the composition root (`apps/extension/src/background/index.ts`).
-- **UI & Manifest:** Add export control in the popup/options UI and ensure `downloads` permission is specified in `manifest.json`.
+## Scope — Milestone M5
+
+### packages/export (Layer 2)
+- Implement `ObsidianSerializer` (implements `ISerializer`):
+  - **Vault layout:** one `.md` per resource in `{kind}/` subfolder.
+  - **Attachments:** binary parts placed in `attachments/` alongside each note.
+  - **`[[wikilinks]]`:** children and resources by the same author cross-linked.
+  - **Tag frontmatter:** top-level `tags:` list derived from `kind` and `sourceMetadata`.
+  - **Body:** reuse `renderBlock()` from `block-renderer.ts`.
+  - **Path sanitization:** extract `sanitizePath()` helper (R5 from the architecture); share it with `MarkdownSerializer`.
+- Export `ObsidianSerializer` from `packages/export/src/index.ts`.
+
+### Serializer Registry (Layer 4)
+- Add `[ExportTarget.OBSIDIAN, new ObsidianSerializer()]` to `createSerializerRegistry()` in `apps/extension/src/background/export/registry.ts`.
+
+### UI
+- Add `OBSIDIAN` to the popup Export panel's target selector.
 
 ## Constraints
-- MV3-safe execution: yield to the event loop appropriately and use cursor checkpointing.
-- The coordinator must not violate the purity of `packages/export`.
+- No new storage/MV3 imports in `packages/export`.
+- Dependency-cruiser must remain green.
+- `ExportWriter`, `ExportCoordinator`, and the ZIP infrastructure are reused as-is.
 
 ## Files Expected to Change
-- `apps/extension/src/background/export-coordinator.ts` (New)
-- `apps/extension/src/background/export-writer.ts` (New)
-- `apps/extension/src/background/index.ts` (Wiring)
-- `apps/extension/manifest.json` (Permissions)
-- Relevant tests
+- `packages/export/src/obsidian-serializer.ts` (New)
+- `packages/export/src/block-renderer.ts` (extract `sanitizePath()` if not already done)
+- `packages/export/src/index.ts` (barrel export)
+- `packages/export/tests/obsidian-serializer.test.ts` (New)
+- `apps/extension/src/background/export/registry.ts` (one line)
+- `apps/extension/src/popup/index.tsx` (UI option)
 
 ## Risks
-- MV3 suspension during large exports requires careful checkpointing.
-- Memory constraints when generating large ZIP files in the background worker.
+- Path sanitization edge cases (special chars, long IDs, filesystem limits).
+- Wikilink resolution may be non-trivial for large exports with cross-referencing resources.
 
 ## Exit Criteria
-- `ExportCoordinator` successfully completes test runs with mocked storage.
-- Full end-to-end export works, generating valid NDJSON and ZIP (Markdown) files via the browser's download API.
-- All new orchestrator logic has test coverage.
+- `ObsidianSerializer` passes all unit tests (vault layout, wikilinks, tags, body, binary parts).
+- `dependency-cruiser` remains green.
+- Obsidian target available in the popup UI and end-to-end verified via the serializer registry.
+- All gate suite checks pass.

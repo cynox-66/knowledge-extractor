@@ -15,7 +15,7 @@
       "js": ["src/content/index.ts"]
     }
   ],
-  "permissions": ["activeTab", "scripting", "alarms", "storage", "offscreen"],
+  "permissions": ["activeTab", "scripting", "alarms", "storage", "offscreen", "downloads"],
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';"
   }

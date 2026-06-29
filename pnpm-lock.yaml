@@ -53,6 +53,9 @@ importers:
       '@knowledge-extractor/connector-instagram':
         specifier: workspace:*
         version: link:../../connectors/instagram
+      '@knowledge-extractor/export':
+        specifier: workspace:*
+        version: link:../../packages/export
       '@knowledge-extractor/shared':
         specifier: workspace:*
         version: link:../../packages/shared
