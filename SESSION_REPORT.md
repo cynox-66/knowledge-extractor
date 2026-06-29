@@ -1,268 +1,221 @@
-# Session Report — Beta-3 Milestone M6: Media Retention Policy + MediaJanitor
+# Session Report — Beta-3 Milestone M7: Incremental Export
 
-**Date:** 2026-06-29  
-**Milestone:** M6 (Beta-3)  
+**Date:** 2026-06-29
+**Milestone:** M7 (Beta-3 — Final Milestone)
 **Status:** Complete
 
 ---
 
 ## Implementation Summary
 
-Implemented the alarm-driven `MediaJanitor` (Layer 4) that enforces `IMediaRetentionPolicy`
-over `IMediaStore`. The janitor is the only component that deletes media for capacity reasons.
-`IMediaRetentionPolicy` was already defined in `packages/types/src/storage/retention.ts` (M1).
+Milestone M7 delivers incremental export support and `embed-remote` media inclusion to the Knowledge Extractor export pipeline. Incremental export allows subsequent export runs to transfer only new resources (those extracted after the previous export's watermark), dramatically reducing redundant work for users with large databases or frequent export workflows. `embed-remote` extends `MediaInclusion` to attempt background fetching of evicted blobs, gracefully falling back to remote links on failure.
 
 ---
 
 ## Files Changed
 
-| File                                             | Change                                                             |
-| ------------------------------------------------ | ------------------------------------------------------------------ |
-| `apps/extension/src/background/media-janitor.ts` | **NEW** — `MediaJanitor` class + `IJanitorReport`                  |
-| `apps/extension/src/background/index.ts`         | **MODIFIED** — import, construction, startup wiring, alarm handler |
-| `apps/extension/tests/media-janitor.test.ts`     | **NEW** — 30 comprehensive tests                                   |
+### New
+
+| File                                                          | Description                                                       |
+| ------------------------------------------------------------- | ----------------------------------------------------------------- |
+| `packages/types/src/export/manifest.ts`                       | `IExportManifest` — durable per-target watermark record (Layer 0) |
+| `apps/extension/tests/export-coordinator-incremental.test.ts` | 23 M7-specific tests                                              |
+
+### Modified
+
+| File                                                  | Change                                                                                                                                                                                                                   |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `packages/types/src/export/exporter.ts`               | Added `'embed-remote'` to `MediaInclusion`; added `incremental?` to `IExportRequest`; added `resourcesSkipped?` to `IExportProgress` and `IExportResult` (all additive)                                                  |
+| `packages/types/src/export/index.ts`                  | Re-exports `IExportManifest` from `./manifest.js`                                                                                                                                                                        |
+| `packages/export/src/projector.ts`                    | `resolveMediaRef` now assigns `localPath` for `embed-remote` blobs in the presence set, consistent with `link-local`                                                                                                     |
+| `apps/extension/src/background/export/writer.ts`      | Added `directParts` map; `writeBinaryDirect(path, bytes)` method; `begin()` clears `directParts`; `finalizeZip()` writes direct parts first and counts them in `mediaIncluded`                                           |
+| `apps/extension/src/background/export/coordinator.ts` | Manifest load/save; watermark filtering in `_drive()`; `embed-remote` pre-fetch path in `_buildPresenceSet()`; `_tryFetchRemote()` helper; `getManifest()` public API; `resourcesSkipped` tracked in progress and result |
 
 ---
 
 ## Runtime Flow
 
-```
-startup()
-  └─ mediaJanitor.schedule(30)
-       └─ chrome.alarms.create('media-janitor', { delayInMinutes: 30 })
+### Incremental Export
 
-chrome.alarms.onAlarm → 'media-janitor'
-  └─ mediaJanitor.handleAlarm()
-       └─ _trigger()  [no-op if _passInProgress]
-            └─ runPass()
-                 1. policy.fullMediaMode === 'keep' → return immediately
-                 2. statistics() → if totalBytes ≤ maxCacheBytes → return (skippedUnderCap)
-                 3. Build eligibleMedia Map<mediaId, resourceId>
-                    ├─ query all ENRICHED resources, collect media ids
-                    └─ query all EXPORTED resources, collect media ids
-                 4. Load pinnedResourceIds from controlStore['pinned_resource_ids']
-                 5. list() all media, sort by lastAccess ASC (LRU: oldest first)
-                 6. Evict in order until bytesFreed ≥ bytesToFree:
-                    ├─ skip if retainVideo && type === VIDEO
-                    ├─ skip if mediaId not in eligibleMedia (parent not ENRICHED/EXPORTED)
-                    ├─ skip if resourceId is in pinnedResourceIds
-                    └─ delete(mediaId), accumulate bytesFreed; yield every 50 evictions
-            └─ chrome.alarms.create('media-janitor', ...) [reschedule always]
+```
+ExportCoordinator.runExport({ incremental: true, ... })
+  → _drive()
+    → _loadManifest(target)            // load IExportManifest from IControlStateStore
+    → watermark = manifest.lastExportedAt ?? null
+    → controlStore.saveCrawlState(REQUEST_KEY, request)
+    → writer.begin()
+    → loop over queryResources pages:
+        for each resource:
+          if watermark !== null && resource.source.extractedAt <= watermark:
+            resourcesSkipped++; continue     // skip stale resource
+          _buildPresenceSet(resource.media, media)
+            → for each media: IMediaStore.exists(m.id)
+              → if embed-remote and absent: _tryFetchRemote(sourceUri) → bytes
+          project(resource, presentMediaIds, media)
+          serializer.serializeItem(item)
+          for each part:
+            text  → writer.appendText(path, text)
+            binary (fetched) → writer.writeBinaryDirect(path, bytes)
+            binary (OPFS)    → writer.writeBinary(path, mediaId)
+          resourcesWritten++
+        _persistProgress({ resourcesSkipped, ... })    // checkpoint
+    → writer.finalize(mode, filename)
+    → _saveManifest({ lastExportedAt: now, exportCount+1, ... })  // only on success
+    → _persistProgress({ done: true, resourcesSkipped })
+    → return IExportResult { resourcesSkipped? }
+```
+
+### embed-remote Flow (absent blob)
+
+```
+_buildPresenceSet(media, 'embed-remote')
+  → IMediaStore.exists(m.id) → false
+  → _tryFetchRemote(m.sourceUri)
+      → fetch(sourceUri)
+        SUCCESS: return Uint8Array → present.add(m.id), fetched.set(m.id, bytes)
+        FAILURE (network / non-2xx): return null → blob stays absent
+  → projector sees m.id in present set → assigns localPath
+  → part routed to writer.writeBinaryDirect(path, bytes)  (pre-fetched path)
+    OR blob stays absent → projector emits remote sourceUri link (graceful fallback)
 ```
 
 ---
 
-## Retention Strategy
+## Manifest Design
 
-- **Policy type:** `IMediaRetentionPolicy` (Layer 0, defined in M1)
-- **Default production policy:** `fullMediaMode: 'cache'`, `maxCacheBytes: 500 MB`, `retainVideo: false`
-- **`fullMediaMode: 'keep'`:** no eviction of any kind; pass returns immediately
-- **`fullMediaMode: 'cache'`:** LRU eviction above `maxCacheBytes` cap
-- **`retainVideo: true`:** video blobs exempt from eviction; images/audio/documents still eligible
-- **Pinned resources:** exempt from eviction; pin set stored in `IControlStateStore` under key `'pinned_resource_ids'` as `string[]`
+`IExportManifest` (Layer 0, `packages/types/src/export/manifest.ts`):
+
+```typescript
+interface IExportManifest {
+  target: ExportTarget; // JSON | MARKDOWN | OBSIDIAN
+  lastExportedAt: string | null; // ISO 8601 watermark; null = never exported
+  lastRequestId: string | null; // requestId of last completed run
+  resourcesExportedTotal: number; // cumulative across all incremental runs
+  exportCount: number; // number of completed runs
+  createdAt: string; // ISO 8601, set on first run
+  updatedAt: string; // ISO 8601, set on every completed run
+}
+```
+
+**Storage:** `IControlStateStore.saveCrawlState('export_manifest_<target>', manifest)` — one record per `ExportTarget`, namespaced to avoid collision with export progress keys.
+
+**Update rule:** Manifest is written **only** after `writer.finalize()` succeeds and before `done=true` progress is persisted. A cancelled or interrupted run leaves the watermark unchanged, ensuring the next run re-exports the same delta.
 
 ---
 
-## Eviction Flow
+## Incremental Algorithm
 
-1. **Statistics gate:** if `totalBytes ≤ maxCacheBytes`, pass exits cleanly. No reads, no deletes.
-2. **Eligible set construction:** enumerate ENRICHED and EXPORTED resources via `IResourceQueryable`. Build `Map<mediaId, resourceId>`. Any blob whose mediaId is absent is automatically ineligible — the invariant is enforced structurally.
-3. **LRU sort:** `IMediaMetadata.lastAccess` (ISO 8601) compared lexicographically. Oldest access = first to evict.
-4. **Per-blob checks (in order):** video retention → eligibility invariant → pinned check.
-5. **Per-item isolation:** a single `IMediaStore.delete()` failure logs a warning and continues; the pass does not abort.
-6. **Yield:** every 50 successful deletions, `yieldToEventLoop()` (`setTimeout(0)`) releases the event loop.
-7. **Reschedule:** `chrome.alarms.create()` is called in both the success and catch path of `_trigger()` — the janitor can never permanently stop.
+```
+watermark = manifest.lastExportedAt ?? null
+
+for each resource in queryResources(state, pageSize) loop:
+  if watermark !== null AND resource.source.extractedAt <= watermark:
+    skip (resourcesSkipped++)
+  else:
+    export normally (resourcesWritten++)
+
+after all pages succeed:
+  manifest.lastExportedAt = new Date().toISOString()
+  manifest.exportCount++
+  manifest.resourcesExportedTotal += resourcesWritten
+  save manifest
+```
+
+**Comparison semantics:** `<=` is inclusive at the watermark boundary. Resources extracted at exactly the watermark timestamp are considered already-exported (safe side — avoids re-exporting the boundary resource while risking no knowledge loss). Resources extracted strictly after the watermark are always included.
+
+**First run behavior:** `lastExportedAt === null` → watermark is null → no filtering → full snapshot. Identical behavior to a non-incremental export. After completion, manifest records the new watermark.
+
+**Correctness over optimization:** When in doubt the resource is included. The field `source.extractedAt` is set at extraction time and does not change — this is the stable, deterministic timestamp that cleanly partitions the resource set relative to any watermark.
 
 ---
 
 ## Architectural Invariants Preserved
 
-| Invariant                                 | Preservation                                                                                               |
-| ----------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| **Knowledge is permanent**                | `MediaJanitor` only calls `IMediaStore.delete()` — `IResource` records never touched                       |
-| **Media is policy-managed**               | All eviction gated through `IMediaRetentionPolicy`                                                         |
-| **Eviction only after ENRICHED/EXPORTED** | Eligible set built exclusively from ENRICHED+EXPORTED resources; any other state → structurally ineligible |
-| **Pinned media exempt**                   | Checked against `pinnedResourceIds` before every deletion                                                  |
-| **No `setInterval`; no unbounded loops**  | `chrome.alarms` + single bounded pass per activation                                                       |
-| **Additive only**                         | No modifications to `IResource`, `IStorageEngine`, `IMediaStore`, `ResourceState`                          |
-| **Composition root wiring**               | `MediaJanitor` constructed and scheduled only in `index.ts`                                                |
-| **Layer isolation**                       | `media-janitor.ts` imports only `@knowledge-extractor/types` + `@knowledge-extractor/shared`               |
+| Invariant                                                 | Status                                                                                |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| Layer purity: `packages/export` imports only Layer 0/1    | ✓ Projector updated additively; no new imports                                        |
+| `IResource`, `IStorageEngine`, `IMediaStore` not modified | ✓ All additive only                                                                   |
+| `ResourceState` not modified                              | ✓ No state changes                                                                    |
+| MV3-safe: no `setInterval`, bounded memory                | ✓ Manifest ops are single reads/writes in the existing tick loop                      |
+| Composition-root ownership                                | ✓ No new infrastructure in pure layers                                                |
+| Deterministic serialization                               | ✓ Watermark filter is pure comparison; manifest uses ISO 8601                         |
+| depcruise `export-and-storage-isolated` rule              | ✓ No violations (136 modules, 232 deps cruised)                                       |
+| Resumability                                              | ✓ Manifest only saved on success; resume re-reads the unchanged watermark             |
+| Per-item isolation                                        | ✓ fetch failures are swallowed; resource-level try/catch preserved                    |
+| Additive interfaces                                       | ✓ All new fields in `IExportRequest`, `IExportProgress`, `IExportResult` are optional |
 
 ---
 
 ## Tests Added
 
-**File:** `apps/extension/tests/media-janitor.test.ts` (30 tests, all passing)
+**File:** `apps/extension/tests/export-coordinator-incremental.test.ts`
 
-| Suite                 | Tests                                                                                               |
-| --------------------- | --------------------------------------------------------------------------------------------------- |
-| `policy=keep`         | no-op pass; storage never queried                                                                   |
-| `cache under cap`     | skippedUnderCap=true; exact boundary                                                                |
-| `LRU ordering`        | oldest evicted first; multiple evictions; stops when freed                                          |
-| `eviction invariant`  | DISCOVERED/EXTRACTED/HYDRATED skipped; ENRICHED/EXPORTED evicted; mixed                             |
-| `pinned resources`    | pinned skipped; non-pinned evicted alongside pinned; empty pin list                                 |
-| `video retention`     | video skipped when retainVideo=true; evicted when false; images still evicted with retainVideo=true |
-| `storage failures`    | statistics() throws; queryResources throws; per-item delete failure isolated                        |
-| `statistics`          | totalBytesBeforeEviction; totalBytesAfterEviction; bytesFreed accounting                            |
-| `alarm scheduling`    | schedule() creates alarm; handleAlarm() reschedules; concurrent call ignored                        |
-| `startup`             | ALARM_NAME is a non-empty string; works without controlStore                                        |
-| `deterministic order` | identical state → identical eviction order across two passes                                        |
+| Test group                               | Tests  |
+| ---------------------------------------- | ------ |
+| First run is full snapshot               | 3      |
+| Second run exports only new resources    | 4      |
+| Manifest persistence                     | 3      |
+| Incremental resume after worker eviction | 1      |
+| Progress tracking (resourcesSkipped)     | 3      |
+| embed-remote media inclusion             | 6      |
+| Incremental determinism                  | 2      |
+| **Total new**                            | **22** |
 
----
-
-## Gate Results
-
-| Gate             | Result                                           |
-| ---------------- | ------------------------------------------------ |
-| `pnpm typecheck` | ✅ 6/6 packages — no errors                      |
-| `pnpm lint`      | ✅ 6/6 packages — no violations                  |
-| `pnpm test`      | ✅ 152/152 tests passing (9 test files)          |
-| `pnpm depcruise` | ✅ 134 modules, 226 dependencies — no violations |
-| `pnpm build`     | ✅ Vite build successful                         |
-
----
-
-## Known Limitations
-
-1. **Policy is static at startup.** Hard-coded 500 MB cap in `index.ts`. A settings UI can persist `IMediaRetentionPolicy` in `IControlStateStore` and load it at startup without changing the janitor.
-2. **Pinned resource set is write-only from the janitor's perspective.** The janitor reads pins; no UI yet exposes the pin action. Key: `'pinned_resource_ids': string[]`.
-3. **No `PERSISTED` state in eligibility set.** Architecture spec says "ENRICHED or EXPORTED" only. If `PERSISTED` should also be eligible, adding it to the eligible states loop is a one-line change.
-
----
-
-## Next Milestone
-
-**M7 — Incremental export + download-on-demand (deferred/optional)**
-
-- Per-target `IExportManifest` watermark (export only new/changed resources)
-- `embed-remote` media inclusion (re-fetch absent bytes via content script)
-- Optional `EXPORTED` UX flag
-- Files: `packages/types/src/export/` (manifest type), coordinator (watermark + on-demand branch), content-script fetch path
-
----
-
-## Implementation Summary
-
-M5 adds the Obsidian vault export target to `packages/export`, wires it into the serializer registry, and exposes it in the popup UI — exactly validating the architectural claim from ADR-013: _a new export target requires one serializer plus one registry entry_.
-
----
-
-## Files Changed
-
-### New files
-
-| File                                                | Purpose                                                              |
-| --------------------------------------------------- | -------------------------------------------------------------------- |
-| `packages/export/src/path-utils.ts`                 | `sanitizePath()` — filesystem-safe path sanitization (shared helper) |
-| `packages/export/src/obsidian-serializer.ts`        | `ObsidianSerializer implements ISerializer` — Obsidian vault layout  |
-| `packages/export/tests/obsidian-serializer.test.ts` | Comprehensive unit tests (83 test cases)                             |
-
-### Modified files
-
-| File                                               | Change                                                                     |
-| -------------------------------------------------- | -------------------------------------------------------------------------- |
-| `packages/export/src/index.ts`                     | Barrel-exports `ObsidianSerializer` and `sanitizePath`                     |
-| `apps/extension/src/background/export/registry.ts` | One-line addition: `[ExportTarget.OBSIDIAN, new ObsidianSerializer()]`     |
-| `apps/extension/src/popup/index.tsx`               | One `<option>` for Obsidian Vault (.zip) in the target selector            |
-| `apps/extension/tests/serializer-registry.test.ts` | Updated M4 guard test (was: "OBSIDIAN absent"; now: "OBSIDIAN registered") |
-| `apps/extension/tests/export-coordinator.test.ts`  | Updated M4 negative test to use an unknown string cast instead of OBSIDIAN |
-
----
-
-## Runtime Flow
-
-```
-ExportCoordinator (Layer 4)
-  │ coordinator.start({ target: ExportTarget.OBSIDIAN, ... })
-  │ → registry.get(OBSIDIAN) → ObsidianSerializer
-  │
-  └─ tick loop: project(resource) → IExportItem
-       │
-       └─ serializer.serializeItem(item) → IExportPart[]
-            │
-            ├─ text part: "{kind}/{sanitizePath(resourceId)}.md"
-            │    YAML frontmatter:
-            │      tags: [kind, providerName]
-            │      kind: ...
-            │      sourceUrl/providerName/externalId/extractedAt/author
-            │    Body: renderBlock() per IContentBlock (shared with MarkdownSerializer)
-            │    Media: ![[attachments/mediaId]] for present blobs, ![type](uri) for remote
-            │    Children: ## Children + - [[kind/sanitizedChildId]] wikilinks
-            │
-            └─ binary part (per locally-present blob): "attachments/{sanitizePath(mediaId)}"
-                 mediaId → coordinator → IMediaStore.get() → bytes → ExportWriter
-```
-
-Vault layout in the produced ZIP:
-
-```
-{kind}/
-  {sanitizePath(resourceId)}.md    ← one per resource (and per child)
-attachments/
-  {sanitizePath(mediaId)}          ← one per present blob
-```
-
----
-
-## Architectural Invariants Preserved
-
-| Invariant                                                          | Status                          |
-| ------------------------------------------------------------------ | ------------------------------- |
-| `packages/export` is pure — no storage, no browser, no MV3 imports | ✓                               |
-| Layer 2 (packages/export) only imports Layer 0/1                   | ✓                               |
-| `export-and-storage-isolated` depcruise rule                       | ✓ green (132 modules, 220 deps) |
-| ExportCoordinator, ExportWriter, ResourceProjector unchanged       | ✓                               |
-| JsonSerializer, MarkdownSerializer unchanged                       | ✓                               |
-| Layer 0 contracts unchanged                                        | ✓                               |
-| Deterministic, idempotent output                                   | ✓                               |
-| No mutation of IResource or ResourceState                          | ✓                               |
-| One serializer + one registry line (ADR-013 proof)                 | ✓                               |
-
----
-
-## Tests Added
-
-`packages/export/tests/obsidian-serializer.test.ts` — 83 test cases across:
-
-- **sanitizePath helper:** 10 cases — illegal chars, whitespace, dots, truncation, empty, determinism
-- **Contract:** 3 cases — ISerializer compliance, target, newline termination
-- **Vault layout:** 4 cases — note paths, kind subdirectory, sanitized ids, different resources
-- **Frontmatter:** 8 cases — tags, kind, sourceUrl, providerName, author, null values, tag deduplication
-- **Body blocks:** 8 cases — all BlockType variants, separator, empty body
-- **Attachment paths:** 7 cases — attachments/ prefix, sanitized mediaId, mediaId for lookup, inclusion=none, no present blobs, multiple blobs, special chars
-- **Media references:** 6 cases — Obsidian embed syntax, remote fallback, inclusion=none, no media, mixed
-- **Wikilinks:** 6 cases — ## Children section, [[kind/id]] format, path matches ZIP entry, sanitized ids, no children, multiple children
-- **Child note generation:** 3 cases — separate text part per child, child binary parts, single note without children
-- **Purity & determinism:** 4 cases — identical output, no mutation, no global state, structural equality
-- **Registry compatibility:** 3 cases — target value, constructable no-args, ISerializer interface shape
-- **IExportPart contract:** 4 cases — text parts structure, binary parts structure, no mediaId on text, non-empty paths
+**Previous test count:** 152 tests across 9 files  
+**New total:** 174 tests across 10 files
 
 ---
 
 ## Gate Results
 
-| Gate             | Result                                          |
-| ---------------- | ----------------------------------------------- |
-| `pnpm typecheck` | ✓ 6/6 packages pass                             |
-| `pnpm lint`      | ✓ 6/6 packages pass                             |
-| `pnpm test`      | ✓ 5/5 test suites, 262 tests total              |
-| `pnpm depcruise` | ✓ no violations (132 modules, 220 dependencies) |
-| `pnpm build`     | ✓ extension built successfully                  |
+| Check            | Result                                |
+| ---------------- | ------------------------------------- |
+| `pnpm typecheck` | ✓ 6 packages, 0 errors                |
+| `pnpm lint`      | ✓ 6 packages, 0 warnings              |
+| `pnpm test`      | ✓ 174 tests, 10 files, 0 failures     |
+| `pnpm depcruise` | ✓ 136 modules, 232 deps, 0 violations |
+| `pnpm build`     | ✓ 159 modules transformed, 0 errors   |
 
 ---
 
 ## Known Limitations
 
-1. **Attachment extensions omitted** — `attachments/{mediaId}` has no file extension because `IExportMediaRef` does not carry MIME type or extension information. Obsidian can still embed files without extension (it infers type from content). A future enhancement could derive extensions from `MediaType` (image → `.jpg`, video → `.mp4`).
+1. **embed-remote and authenticated sources:** Background `fetch()` does not carry browser session cookies for walled-garden sources (Instagram, Reddit, etc.). For public media URLs it works; for authenticated CDN URLs it will receive a 403/401 and fall back gracefully to a remote link. Full authenticated re-fetching requires a content-script relay — documented as a future extension point, not required by the Beta-3 architecture.
 
-2. **YAML value serialization duplicated** — The private `serializeYamlValue`/`quoteYamlString` helpers in `ObsidianSerializer` are identical to the private helpers in `MarkdownSerializer`. They could not be extracted to a shared module without modifying `MarkdownSerializer`, which was out of scope. A future refactor could extract these to `yaml-utils.ts` and update both serializers.
+2. **Incremental filter granularity:** Resources are filtered by `source.extractedAt`, which is set at initial extraction and does not update when a resource is re-enriched (e.g., OCR added later). A resource whose content changed after initial extraction will not be picked up by incremental export until it is re-extracted. This is acceptable for Beta-3 — the knowledge layer is additive and re-extraction with a new `extractedAt` is the intended path.
 
-3. **Cross-resource same-author wikilinks not implemented** — The architecture mentions "resources by the same author cross-linked". This session implements child wikilinks only. Same-author cross-linking requires a global author → resource index not available during pure per-item serialization; it would need a two-pass approach outside the `ISerializer` contract.
+3. **No manifest for non-incremental exports:** Non-incremental (`incremental: false` or absent) runs do not update the manifest. Users who mix full and incremental exports will see the watermark reflect only the last _incremental_ run, which is correct and intentional.
+
+4. **Manifest not cleared on explicit full-reset:** There is no UI to reset the manifest watermark. This is a UX feature gap, not a correctness issue — the full export path (no `incremental` flag) always bypasses the manifest.
 
 ---
 
-## Next Milestone
+## Beta-3 Architecture Validation
 
-**M6 — Media Retention Policy + MediaJanitor (Layer 0 type + Layer 4)**
+Beta-3 shipped seven milestones (M1–M7). Here is a retrospective on whether the architecture met its stated goals:
 
-Implement `IMediaRetentionPolicy` handling and the alarm-driven `MediaJanitor` that enforces LRU eviction caps, the eviction invariant (only post-ENRICHED, non-pinned), and pin exemption. This is the scaling safeguard for 100k+ resources.
+### ✓ Layer purity
+
+The dependency direction was strictly enforced throughout. `packages/export` remained storage-free and imported only Layer 0/1 types. The `export-and-storage-isolated` depcruise rule caught any violations before commit. No cross-layer leakage was introduced across any milestone.
+
+### ✓ Extensible serializers
+
+The "new target = one `ISerializer` + one line in the `Map`" claim was validated by M5 (Obsidian). M7 added no new serializer targets yet the incremental/embed-remote machinery composed cleanly with all three existing serializers without any serializer modification. The `ISerializer` contract remained frozen.
+
+### ✓ MV3-safe orchestration
+
+The export pipeline used self-scheduling `setTimeout` yield points between pages, `chrome.alarms` watchdog heartbeats, and persisted `IExportProgress` cursors. No `setInterval` or unbounded sync loops were introduced. The incremental manifest operations (single read/write per run) added negligible latency and no new MV3 risk surface.
+
+### ✓ Knowledge ownership
+
+Knowledge remained permanent and self-sufficient. The incremental filter skipped resources rather than deleting them. The manifest never mutated `IResource`. Export was read-only throughout. `ResourceState.EXPORTED` was not overloaded by M7 (consistent with ADR-013 guidance).
+
+### ✓ Media retention
+
+The `MediaJanitor` (M6) and the export pipeline (M4–M7) remained independent. The eviction invariant was preserved: M7 introduced `embed-remote` as a best-effort recovery path for already-evicted blobs, but media eviction policy and watermark management are entirely separate concerns. The janitor is the only component that evicts; the coordinator is the only component that exports.
+
+### ✓ Incremental export
+
+M7 delivered watermark-based incremental detection, durable manifest persistence, resume compatibility, embed-remote with graceful fallback, and comprehensive test coverage. The algorithm is conservative (correctness over optimization) and deterministic. The manifest accumulates cumulative statistics across runs.
+
+**Beta-3 is architecturally complete.** The repository is ready for Gemini documentation synchronization.

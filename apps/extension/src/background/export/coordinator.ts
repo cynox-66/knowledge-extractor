@@ -7,6 +7,7 @@ import {
   type IExportRequest,
   type IExportProgress,
   type IExportResult,
+  type IExportManifest,
 } from '@knowledge-extractor/types';
 import { project } from '@knowledge-extractor/export';
 import { Logger } from '@knowledge-extractor/shared';
@@ -18,6 +19,8 @@ const PAGE_SIZE = 20;
 /** Control-state keys. App-local opaque records — not Layer-0 contracts. */
 const PROGRESS_KEY = 'export_progress';
 const REQUEST_KEY = 'export_request';
+/** Per-target manifest key prefix. Full key: `export_manifest_<target>`. */
+const MANIFEST_KEY_PREFIX = 'export_manifest_';
 
 /** Outcome of a non-blocking {@link ExportCoordinator.start}. */
 export interface IExportStartResult {
@@ -45,6 +48,21 @@ function generateRequestId(): string {
  * build a media-presence set from {@link IMediaStore}, run the pure `project()` +
  * the selected pure {@link ISerializer}, stream the resulting parts to the
  * {@link ExportWriter}, and persist {@link IExportProgress} for resumability and UI.
+ *
+ * ### Incremental export (M7)
+ * When {@link IExportRequest.incremental} is true, the coordinator loads the
+ * per-target {@link IExportManifest} before the run begins. Resources whose
+ * `source.extractedAt` is at or before {@link IExportManifest.lastExportedAt}
+ * are skipped; only newer resources are exported. The manifest is updated **only**
+ * after a successful completion — a cancelled or interrupted run leaves the
+ * previous watermark intact so the next run re-exports the same delta.
+ *
+ * ### embed-remote media (M7)
+ * When {@link IExportRequest.media} is `'embed-remote'`, absent blobs are
+ * attempted via a background `fetch()` on `sourceUri` before projection.
+ * Successfully fetched bytes are pre-resolved and written directly to the writer
+ * via {@link ExportWriter.writeBinaryDirect}; failures fall back to a remote link
+ * (graceful degradation). Network errors never abort the export.
  *
  * ### Concurrency / duplicate protection
  * A single in-memory `_activeRun` latch (set synchronously before the first
@@ -168,6 +186,14 @@ export class ExportCoordinator {
     return this.controlStore.getCrawlState<IExportProgress>(PROGRESS_KEY);
   }
 
+  /**
+   * Returns the durable export manifest for the given target, or null if no
+   * incremental export has completed yet for that target.
+   */
+  getManifest(target: ExportTarget): Promise<IExportManifest | null> {
+    return this._loadManifest(target);
+  }
+
   // -- internals -------------------------------------------------------------
 
   private async _drive(
@@ -178,6 +204,11 @@ export class ExportCoordinator {
     const startedAt = new Date().toISOString();
     const mode: ExportArtifactMode = request.target === ExportTarget.JSON ? 'single-file' : 'zip';
 
+    // Incremental: load the watermark for this target before any paging starts.
+    // Manifest is null on first run → full snapshot (no filtering).
+    const manifest = request.incremental === true ? await this._loadManifest(request.target) : null;
+    const watermark = manifest?.lastExportedAt ?? null;
+
     // Persist the request so a watchdog resume after SW eviction can reconstruct
     // it (IExportProgress alone does not carry state/inclusion).
     await this.controlStore.saveCrawlState(REQUEST_KEY, request);
@@ -187,6 +218,7 @@ export class ExportCoordinator {
 
     let resourcesWritten = 0;
     let mediaQueued = 0;
+    let resourcesSkipped = 0;
     let cursor: string | undefined;
 
     do {
@@ -199,7 +231,19 @@ export class ExportCoordinator {
       for (const resource of page.items) {
         // Per-item isolation: one bad resource must never abort the export.
         try {
-          const presentMediaIds = await this._buildPresenceSet(resource.media, request.media);
+          // Incremental watermark filter: skip resources extracted at or before
+          // the last successful export. When watermark is null (first run or
+          // non-incremental), all resources are included.
+          if (watermark !== null && resource.source.extractedAt <= watermark) {
+            resourcesSkipped++;
+            continue;
+          }
+
+          const { present: presentMediaIds, fetched: fetchedBlobs } = await this._buildPresenceSet(
+            resource.media,
+            request.media,
+          );
+
           const item = project(resource, presentMediaIds, request.media);
           const parts = serializer.serializeItem(item);
 
@@ -207,7 +251,13 @@ export class ExportCoordinator {
             if (part.kind === 'text' && part.text !== undefined) {
               this.writer.appendText(part.path, part.text);
             } else if (part.kind === 'binary' && part.mediaId !== undefined) {
-              this.writer.writeBinary(part.path, part.mediaId);
+              const fetchedBytes = fetchedBlobs.get(part.mediaId);
+              if (fetchedBytes !== undefined) {
+                // embed-remote: bytes were pre-fetched from sourceUri; write directly.
+                this.writer.writeBinaryDirect(part.path, fetchedBytes);
+              } else {
+                this.writer.writeBinary(part.path, part.mediaId);
+              }
               mediaQueued++;
             }
           }
@@ -224,6 +274,7 @@ export class ExportCoordinator {
         target: request.target,
         resourcesWritten,
         mediaWritten: mediaQueued,
+        resourcesSkipped,
         startedAt,
         done: false,
         ...(lastId !== undefined ? { cursor: lastId } : {}),
@@ -233,7 +284,16 @@ export class ExportCoordinator {
       if (this._cancelRequested) {
         this.logger.info(`Export ${requestId} cancelled`);
         await this._clearPersistedState();
-        return this._buildResult(requestId, request.target, resourcesWritten, 0, 0, 0, startedAt);
+        return this._buildResult(
+          requestId,
+          request.target,
+          resourcesWritten,
+          0,
+          0,
+          0,
+          resourcesSkipped,
+          startedAt,
+        );
       }
 
       cursor = page.hasMore ? page.nextCursor : undefined;
@@ -246,11 +306,26 @@ export class ExportCoordinator {
     const filename = buildFilename(request.target, mode);
     const written = await this.writer.finalize(mode, filename);
 
+    // Update the manifest only after a successful, non-cancelled completion.
+    if (request.incremental === true) {
+      const now = new Date().toISOString();
+      await this._saveManifest({
+        target: request.target,
+        lastExportedAt: now,
+        lastRequestId: requestId,
+        resourcesExportedTotal: (manifest?.resourcesExportedTotal ?? 0) + resourcesWritten,
+        exportCount: (manifest?.exportCount ?? 0) + 1,
+        createdAt: manifest?.createdAt ?? now,
+        updatedAt: now,
+      });
+    }
+
     await this._persistProgress({
       requestId,
       target: request.target,
       resourcesWritten,
       mediaWritten: written.mediaIncluded,
+      resourcesSkipped,
       startedAt,
       done: true,
     });
@@ -262,27 +337,62 @@ export class ExportCoordinator {
       written.mediaIncluded,
       written.mediaMissing,
       written.bytes,
+      resourcesSkipped,
       startedAt,
     );
   }
 
   /**
    * Builds the set of media ids whose blobs are present, used by the projector
-   * to assign `localPath` consistently with what the writer will write. Skipped
-   * entirely for `inclusion === 'none'`, which never links local blobs.
+   * to assign `localPath` consistently with what the writer will write. For
+   * `embed-remote`, absent blobs are attempted via a background `fetch()`; the
+   * returned `fetched` map carries successfully pre-fetched bytes keyed by mediaId
+   * so the coordinator can route them to {@link ExportWriter.writeBinaryDirect}.
+   *
+   * Skipped entirely for `inclusion === 'none'`, which never links local blobs.
    */
   private async _buildPresenceSet(
-    media: ReadonlyArray<{ id: string }>,
+    media: ReadonlyArray<{ id: string; sourceUri: string }>,
     inclusion: IExportRequest['media'],
-  ): Promise<ReadonlySet<string>> {
-    if (inclusion === 'none' || media.length === 0) return EMPTY_SET;
+  ): Promise<{ present: ReadonlySet<string>; fetched: ReadonlyMap<string, Uint8Array> }> {
+    if (inclusion === 'none' || media.length === 0) {
+      return { present: EMPTY_SET, fetched: EMPTY_MAP };
+    }
+
     const present = new Set<string>();
+    const fetched = new Map<string, Uint8Array>();
+
     for (const m of media) {
       if (await this.mediaStore.exists(m.id)) {
         present.add(m.id);
+      } else if (inclusion === 'embed-remote') {
+        // Attempt a background fetch for absent blobs; never throw on failure.
+        const bytes = await this._tryFetchRemote(m.sourceUri);
+        if (bytes !== null) {
+          present.add(m.id); // treat as locally present for the projector's localPath
+          fetched.set(m.id, bytes);
+        }
+        // On failure: blob stays absent; projector emits a remote link (graceful fallback).
       }
     }
-    return present;
+
+    return { present, fetched };
+  }
+
+  /**
+   * Attempts a background fetch of `sourceUri`, returning the response bytes on
+   * success or `null` on any failure (network error, CORS, non-2xx, etc.).
+   * Never throws — all errors are swallowed to preserve per-item isolation.
+   */
+  private async _tryFetchRemote(sourceUri: string): Promise<Uint8Array | null> {
+    try {
+      const response = await fetch(sourceUri);
+      if (!response.ok) return null;
+      const buffer = await response.arrayBuffer();
+      return new Uint8Array(buffer);
+    } catch {
+      return null;
+    }
   }
 
   private _persistProgress(progress: Omit<IExportProgress, 'updatedAt'>): Promise<void> {
@@ -302,6 +412,7 @@ export class ExportCoordinator {
     mediaIncluded: number,
     mediaMissing: number,
     bytes: number,
+    resourcesSkipped: number,
     _startedAt: string,
   ): IExportResult {
     return {
@@ -312,6 +423,7 @@ export class ExportCoordinator {
       mediaMissing,
       bytes,
       completedAt: new Date().toISOString(),
+      ...(resourcesSkipped > 0 ? { resourcesSkipped } : {}),
     };
   }
 
@@ -326,9 +438,18 @@ export class ExportCoordinator {
       void chrome.alarms.clear(ExportCoordinator.ALARM_NAME);
     }
   }
+
+  private _loadManifest(target: ExportTarget): Promise<IExportManifest | null> {
+    return this.controlStore.getCrawlState<IExportManifest>(`${MANIFEST_KEY_PREFIX}${target}`);
+  }
+
+  private _saveManifest(manifest: IExportManifest): Promise<void> {
+    return this.controlStore.saveCrawlState(`${MANIFEST_KEY_PREFIX}${manifest.target}`, manifest);
+  }
 }
 
 const EMPTY_SET: ReadonlySet<string> = new Set<string>();
+const EMPTY_MAP: ReadonlyMap<string, Uint8Array> = new Map<string, Uint8Array>();
 
 /** Deterministic-prefix, timestamped artifact filename. */
 function buildFilename(target: ExportTarget, mode: ExportArtifactMode): string {

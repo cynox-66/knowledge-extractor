@@ -63,7 +63,10 @@ function resolveMediaRef(
   presentMediaIds: ReadonlySet<string>,
   inclusion: MediaInclusion,
 ): IExportMediaRef {
-  const hasLocalBlob = presentMediaIds.has(media.id) && inclusion === 'link-local';
+  // embed-remote blobs that were successfully pre-fetched by the coordinator
+  // appear in presentMediaIds and should receive a local path just like link-local.
+  const hasLocalBlob =
+    presentMediaIds.has(media.id) && (inclusion === 'link-local' || inclusion === 'embed-remote');
   return {
     mediaId: media.id,
     type: media.type,

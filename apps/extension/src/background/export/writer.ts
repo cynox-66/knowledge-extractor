@@ -35,6 +35,9 @@ const textEncoder = new TextEncoder();
  *    `IMediaStore`; the writer resolves `mediaId → bytes` here, at finalize time,
  *    so bytes never flow through the pure layer and memory stays bounded until
  *    assembly.
+ *  - For `embed-remote` pre-fetched blobs the coordinator calls
+ *    {@link writeBinaryDirect} to supply pre-resolved bytes directly, bypassing
+ *    the `IMediaStore` lookup.
  *  - Assembles a single file or a ZIP and hands it to the injected
  *    {@link IDownloadGateway}. It never calls `chrome.*` directly.
  *
@@ -48,8 +51,10 @@ export class ExportWriter {
 
   /** path → accumulated text (append-by-path). */
   private textParts = new Map<string, string>();
-  /** path → mediaId (binary written once per path). */
+  /** path → mediaId (binary written once per path, resolved via IMediaStore at finalize). */
   private binaryParts = new Map<string, string>();
+  /** path → pre-resolved bytes (embed-remote: coordinator fetched these remotely). */
+  private directParts = new Map<string, Uint8Array>();
 
   constructor(
     private readonly mediaStore: IMediaStore,
@@ -60,6 +65,7 @@ export class ExportWriter {
   begin(): void {
     this.textParts = new Map();
     this.binaryParts = new Map();
+    this.directParts = new Map();
   }
 
   /** Appends text to the part at `path`, creating it on first write. */
@@ -71,6 +77,15 @@ export class ExportWriter {
   /** Records a binary part to be resolved from {@link IMediaStore} at finalize. */
   writeBinary(path: string, mediaId: string): void {
     this.binaryParts.set(path, mediaId);
+  }
+
+  /**
+   * Records a binary part with pre-resolved bytes (M7 embed-remote path).
+   * These bytes are written directly into the archive without an IMediaStore lookup.
+   * Callers must not supply an empty buffer — omit the call and treat as missing instead.
+   */
+  writeBinaryDirect(path: string, bytes: Uint8Array): void {
+    this.directParts.set(path, bytes);
   }
 
   /**
@@ -104,6 +119,11 @@ export class ExportWriter {
       entries.push({ path, bytes: textEncoder.encode(text) });
     }
 
+    // Pre-resolved bytes from embed-remote: written directly, no IMediaStore lookup needed.
+    for (const [path, bytes] of this.directParts) {
+      entries.push({ path, bytes });
+    }
+
     let mediaIncluded = 0;
     let mediaMissing = 0;
     for (const [path, mediaId] of this.binaryParts) {
@@ -120,6 +140,9 @@ export class ExportWriter {
       entries.push({ path, bytes });
       mediaIncluded++;
     }
+
+    // Include pre-resolved direct parts in the count.
+    mediaIncluded += this.directParts.size;
 
     // Deterministic archive ordering.
     entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));

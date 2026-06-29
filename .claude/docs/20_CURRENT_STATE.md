@@ -1,10 +1,10 @@
 # Current State Dashboard
 
 ## Current Milestone
-Beta-3 (Knowledge Ownership & Export)
+Beta-3 (Knowledge Ownership & Export) — **COMPLETE**
 
 ## Current Objective
-Transition to M7: Incremental export + download-on-demand.
+Transition to Beta-3 Closeout / Architecture Review.
 
 ## Completed Milestones
 - Alpha Stabilization (Sprints A0-A4)
@@ -21,7 +21,8 @@ Transition to M7: Incremental export + download-on-demand.
 - Beta-3 Milestone M3 (Markdown Serializer)
 - Beta-3 Milestone M4 (Export Orchestration End-to-End)
 - Beta-3 Milestone M5 (ObsidianSerializer)
-- **Beta-3 Milestone M6 (Media Retention Policy + MediaJanitor)** — COMPLETE
+- Beta-3 Milestone M6 (Media Retention Policy + MediaJanitor)
+- **Beta-3 Milestone M7 (Incremental Export)** — COMPLETE
 
 ## Active Branch
 `main`
@@ -30,19 +31,14 @@ Transition to M7: Incremental export + download-on-demand.
 None.
 
 ## Recent Engineering Changes
-- **Beta-3 Milestone M6:**
-  - Implemented `MediaJanitor` as an alarm-driven, MV3-safe background process.
-  - Enforced `IMediaRetentionPolicy` limits using LRU eviction based on `lastAccess`.
-  - Architecturally guaranteed ADR-010 ("Knowledge is permanent. Media is policy-managed") by building the eligible eviction set strictly from ENRICHED and EXPORTED resources.
-  - Pinned resources are safely exempted from eviction.
-  - Eviction is additive-only (metadata in `IResource` is untouched) and isolated per-blob.
+- **Beta-3 Milestone M7 (Incremental Export):**
+  - Implemented `IExportManifest` for durable per-target watermark tracking.
+  - Added incremental export capability to `ExportCoordinator`, which reliably filters out previously exported resources using deterministic `source.extractedAt` checks.
+  - Implemented `embed-remote` mode for on-demand media re-fetching, with graceful fallback to remote links if fetching fails (due to network or authentication barriers).
+  - All architecture invariants (purity of `packages/export`, MV3-safe orchestration, additive changes) rigorously preserved.
 
 ## Current Risks
 - **CRITICAL - Missing `eng.traineddata` asset:** The Tesseract.js English language data file (~10 MB) is not bundled via npm. It must be manually downloaded and placed at `apps/extension/public/tesseract/lang/eng.traineddata` before building, otherwise OCR will fail at runtime.
-- **Discovery Performance:** `MutationObserver` currently scans the entire document body, causing quadratic scaling on very large collections.
-- **Eviction window on final-page completion:** If the service worker is evicted after the final page is checkpointed but before `deleteCrawlState` runs, the next activation will run an empty pass and delete the cursor cleanly. This is safe but sub-optimal.
-- **In-memory artifact assembly:** The full NDJSON/ZIP artifact is assembled in memory before download (bounded per-tick, but ceiling is artifact size). A streaming sink can replace `ExportWriter` behind its seam in a future milestone.
-- **Resume re-runs rather than byte-resumes:** `resume()` re-drives from the dataset start rather than the checkpointed page to guarantee a complete artifact (the interrupted attempt never delivered). This is safe and read-only idempotent, but redundant work is performed.
 
 ## Current Technical Debt
 - `Scheduler` and `MetricsCollector` lack automated unit test coverage.
@@ -53,9 +49,11 @@ None.
 - YAML value serialization logic is duplicated across `MarkdownSerializer` and `ObsidianSerializer`.
 - Cross-resource same-author wikilinks not implemented (would require a global index outside the pure projection layer).
 - Policy configuration is static at startup (hard-coded 500 MB).
+- Incremental filter granularity uses `extractedAt` rather than an update timestamp.
+- No UI mechanism to manually reset the manifest watermark.
 
 ## Next Engineering Step
-Milestone M7 — Incremental export + download-on-demand. See `40_NEXT_TASK.md`.
+Beta-3 Closeout / Architecture Review. See `40_NEXT_TASK.md`.
 
 ## Definition of Current Success
-The media lifecycle is fully policy-managed and safe for long-running deployments. ADR-010 is validated: resources exist permanently as knowledge, while raw media blobs are dynamically evicted based on limits, state, and user pinning.
+Beta-3 is fully architecturally validated. Knowledge is permanent (ADR-010), the pure layer handles export projection safely (ADR-011, ADR-012), new serializers are trivial to add (ADR-013), and media management is governed purely by policy (ADR-014). The system is highly robust and prepared for the next architecture phase.

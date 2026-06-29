@@ -13,8 +13,10 @@ export enum ExportTarget {
 export type MediaInclusion =
   | 'link-local' // write present blobs into the bundle and link them;
   // absent blobs fall back to a remote sourceUri link.
-  | 'none'; // never write blobs; link to remote sourceUri (or omit if none).
-// NOTE: download-on-demand ('embed-remote') is deferred to M7.
+  | 'none' // never write blobs; link to remote sourceUri (or omit if none).
+  | 'embed-remote'; // M7: include locally-present blobs; for absent blobs, attempt
+// a background fetch from sourceUri and embed the bytes if successful;
+// graceful fallback to remote link on network failure.
 
 /** A resolved reference to one media asset within an export. */
 export interface IExportMediaRef {
@@ -22,7 +24,7 @@ export interface IExportMediaRef {
   type: MediaType;
   sourceUri: string; // provenance + remote fallback link
   localPath?: string; // relative bundle path; set only when the blob is present
-  // AND inclusion === 'link-local'
+  // AND inclusion === 'link-local' or 'embed-remote'
 }
 
 /**
@@ -63,6 +65,13 @@ export interface IExportRequest {
   target: ExportTarget;
   state: ResourceState; // e.g. ENRICHED
   media: MediaInclusion;
+  /**
+   * When true, only export resources whose {@link IResource.source.extractedAt}
+   * timestamp is strictly after the last successful export watermark stored in
+   * {@link IExportManifest.lastExportedAt}. When no manifest exists yet, the
+   * first incremental run behaves as a full snapshot. (M7)
+   */
+  incremental?: boolean;
 }
 
 /** Persisted to control-state for MV3 resumability and UI progress. */
@@ -75,6 +84,8 @@ export interface IExportProgress {
   startedAt: string;
   updatedAt: string;
   done: boolean;
+  /** Resources skipped by the incremental watermark filter. Present only for incremental runs. */
+  resourcesSkipped?: number;
 }
 
 /** Returned to the UI when an export completes. */
@@ -86,4 +97,6 @@ export interface IExportResult {
   mediaMissing: number;
   bytes: number;
   completedAt: string;
+  /** Resources skipped by the incremental watermark filter. Present only for incremental runs. */
+  resourcesSkipped?: number;
 }
