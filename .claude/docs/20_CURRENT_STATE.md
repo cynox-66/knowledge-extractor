@@ -4,7 +4,7 @@
 Beta-3 (Knowledge Ownership & Export)
 
 ## Current Objective
-Transition to M2: Implement packages/export with JSON/NDJSON serialization.
+Transition to M4: Export Orchestration End-to-End (Layer 4).
 
 ## Completed Milestones
 - Alpha Stabilization (Sprints A0-A4)
@@ -16,7 +16,9 @@ Transition to M2: Implement packages/export with JSON/NDJSON serialization.
 - Beta-2 Phase 4B (Enrichment Cursor Checkpointing)
 - Beta-2 Phase 4C (Self-rescheduling)
 - Beta-2 Phase 4D (ENRICHED state promotion & Runtime Wiring)
-- **Beta-3 Milestone M1 (Export Contracts)** — COMPLETE
+- Beta-3 Milestone M1 (Export Contracts)
+- **Beta-3 Milestone M2 (ResourceProjector + JSON Serializer)** — COMPLETE
+- **Beta-3 Milestone M3 (Markdown Serializer)** — COMPLETE
 
 ## Active Branch
 `main`
@@ -25,10 +27,13 @@ Transition to M2: Implement packages/export with JSON/NDJSON serialization.
 None.
 
 ## Recent Engineering Changes
-- **Beta-3 Milestone M1:** 
-  - Defined Beta-3 export contracts in `packages/types/src/export/exporter.ts`.
-  - Added `IMediaRetentionPolicy` in `packages/types/src/storage/retention.ts`.
-  - Removed deprecated `IExporter` and `ExportFormat`.
+- **Beta-3 Milestones M2 + M3:** 
+  - Created `packages/export` (Layer 2).
+  - Implemented `ResourceProjector` (pure transformation).
+  - Implemented `JsonSerializer` (NDJSON format).
+  - Implemented `MarkdownSerializer` (Markdown output).
+  - Created reusable `block-renderer.ts`.
+  - Added dependency-cruiser rules ensuring `export` and `storage` isolation.
 
 ## Current Risks
 - **CRITICAL - Missing `eng.traineddata` asset:** The Tesseract.js English language data file (~10 MB) is not bundled via npm. It must be manually downloaded and placed at `apps/extension/public/tesseract/lang/eng.traineddata` before building, otherwise OCR will fail at runtime.
@@ -40,9 +45,10 @@ None.
 - `Scheduler` and `MetricsCollector` lack automated unit test coverage.
 - Legacy message bus uses raw string actions instead of strictly typed event unions.
 - `IReconciliationReport` is logged but not persisted — no observable history of passes.
+- Generated `localPath` in exports currently lacks file extensions. (To be resolved by ExportWriter in M4).
 
 ## Next Engineering Step
-Milestone M2 — `packages/export` + projector + JSON (NDJSON) serializer (Layer 2). See `40_NEXT_TASK.md`.
+Milestone M4 — Export Orchestration End-to-End (Layer 4). See `40_NEXT_TASK.md`.
 
 ## Definition of Current Success
-The extraction and enrichment pipelines are stable and self-rescheduling. The Beta-3 export contracts are locked. The next phase will implement the formatting and projection logic to prepare for file output.
+The extraction and enrichment pipelines are stable. The export domain layer (M1) and transformation layer (M2-M3) are completely implemented and isolated. The next phase will wire these components together into an orchestration loop in the background worker.

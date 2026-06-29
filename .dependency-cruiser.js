@@ -35,6 +35,20 @@ module.exports = {
       comment: 'Layer 1 (shared, utils) can only import from Layer 0 (types).',
       from: { path: '^packages/(shared|utils)/' },
       to: { path: '^(packages|connectors|apps)/', pathNot: '^packages/(types|shared|utils)/' }
+    },
+    {
+      name: 'export-and-storage-isolated',
+      severity: 'error',
+      comment: 'packages/export and packages/storage are Layer 2 siblings; neither may import the other.',
+      from: { path: '^packages/export/' },
+      to: { path: '^packages/storage/' }
+    },
+    {
+      name: 'storage-cannot-import-export',
+      severity: 'error',
+      comment: 'packages/storage must not import packages/export (Layer 2 sibling isolation).',
+      from: { path: '^packages/storage/' },
+      to: { path: '^packages/export/' }
     }
   ],
   options: {

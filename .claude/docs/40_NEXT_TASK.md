@@ -1,37 +1,40 @@
 # Next Task
 
 ## Current Milestone
-Beta-3 (Knowledge Ownership & Export) — **Milestone M2: `packages/export` + JSON Serializer**
+Beta-3 (Knowledge Ownership & Export) — **Milestone M4: Export Orchestration End-to-End**
 
 ## Current Objective
-Implement **M2**: Stand up the new `packages/export` workspace package, implement the resource projector, and build the JSON/NDJSON serializer.
+Implement **M4**: Build the `ExportCoordinator` and `ExportWriter` to orchestrate the export process within the background worker (Layer 4).
 
 ## Why this task exists
-With the M1 export contracts finalized in `packages/types`, the next step (Layer 2) is to implement the pure transformation logic that converts an internal `IResource` into format-agnostic `IExportItem`s and subsequently serializes them to text/binary parts.
+The pure projection and serialization logic (Layer 2) was completed in M2 and M3. Now we need to orchestrate the actual data flow: querying resources from storage, resolving media presence, running the serializers, persisting progress, and generating the final download artifact.
 
 ## Pre-conditions (must be verified at session start)
-1. Beta-3 Milestone M1 (Export Contracts) is complete and merged.
-2. `packages/types/src/export/exporter.ts` contains the canonical `IExportItem`, `ISerializer`, and `ExportTarget` contracts.
+1. Beta-3 Milestones M2 and M3 are complete and verified.
+2. `packages/export` provides `ResourceProjector`, `JsonSerializer`, and `MarkdownSerializer` as pure, storage-isolated functions.
 
-## Scope — Milestone M2
-- **New Package:** Create `packages/export` and configure it in the monorepo workspace.
-- **Projector:** Implement a pure function `project(resource, presentMediaIds, inclusion): IExportItem`.
-- **JSON Serializer:** Implement `JsonSerializer` (NDJSON format, one resource per line).
-- **Enforcement:** Add `export-and-storage-isolated` rule to dependency-cruiser to ensure Layer 2 purity.
-- **Tests:** Add unit tests for the projector (media-path assignment, formatting) and the serializer (NDJSON string output).
+## Scope — Milestone M4
+- **ExportCoordinator:** Implement an MV3-safe tick loop over `IResourceQueryable`, building presence maps from `IMediaStore`, driving the projector and serializers, and persisting `IExportProgress` for resumability.
+- **ExportWriter:** Implement ZIP assembly for Markdown and single-file assembly for NDJSON, triggering `chrome.downloads`.
+- **Wiring:** Integrate a serializer registry (`Map<ExportTarget, ISerializer>`) and wire up the coordinator in the composition root (`apps/extension/src/background/index.ts`).
+- **UI & Manifest:** Add export control in the popup/options UI and ensure `downloads` permission is specified in `manifest.json`.
 
 ## Constraints
-- Pure logic only: no actual file writing or storage/MV3 APIs in this milestone.
-- Dependency isolation: `packages/export` must not depend on `packages/storage` or extension APIs.
+- MV3-safe execution: yield to the event loop appropriately and use cursor checkpointing.
+- The coordinator must not violate the purity of `packages/export`.
 
 ## Files Expected to Change
-- `packages/export/*` (new package structure)
-- `.dependency-cruiser.js` (rule addition)
+- `apps/extension/src/background/export-coordinator.ts` (New)
+- `apps/extension/src/background/export-writer.ts` (New)
+- `apps/extension/src/background/index.ts` (Wiring)
+- `apps/extension/manifest.json` (Permissions)
+- Relevant tests
 
 ## Risks
-- Incorrect typing or imports leaking domain logic into the serialization layer.
+- MV3 suspension during large exports requires careful checkpointing.
+- Memory constraints when generating large ZIP files in the background worker.
 
 ## Exit Criteria
-- `packages/export` builds cleanly and passes all local unit tests.
-- `dependency-cruiser` enforces isolation rules.
-- JSON/NDJSON string output behaves as expected in tests.
+- `ExportCoordinator` successfully completes test runs with mocked storage.
+- Full end-to-end export works, generating valid NDJSON and ZIP (Markdown) files via the browser's download API.
+- All new orchestrator logic has test coverage.
