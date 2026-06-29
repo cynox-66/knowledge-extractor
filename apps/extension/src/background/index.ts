@@ -17,6 +17,7 @@ import {
   IControlStateStore,
   IMediaStore,
   IExportRequest,
+  IMediaRetentionPolicy,
 } from '@knowledge-extractor/types';
 import { CrawlController } from './crawl-controller.js';
 import { EnrichmentLoop } from './enrichment-loop.js';
@@ -26,6 +27,7 @@ import { ExportCoordinator } from './export/coordinator.js';
 import { ExportWriter } from './export/writer.js';
 import { ChromeDownloadGateway } from './export/download-gateway.js';
 import { createSerializerRegistry } from './export/registry.js';
+import { MediaJanitor } from './media-janitor.js';
 import { InstagramConnector } from '@knowledge-extractor/connector-instagram';
 import {
   IndexedDbStorageEngine,
@@ -163,6 +165,21 @@ const exportCoordinator =
     ? new ExportCoordinator(idbEngine, mediaStore, controlStore, serializerRegistry, exportWriter)
     : null;
 
+// Media retention policy (Beta-3 M6). Default production policy: cache mode
+// with a 500 MB soft cap, video not retained. The janitor is only meaningful
+// when IndexedDB is present (it needs to query resource states to enforce the
+// eviction invariant). Policy and pinned-ids may be overridden via settings UI
+// in a future milestone; stored in control state under 'media_retention_policy'.
+const defaultRetentionPolicy: IMediaRetentionPolicy = {
+  fullMediaMode: 'cache',
+  maxCacheBytes: 500 * 1024 * 1024, // 500 MB
+  retainVideo: false,
+};
+const mediaJanitor =
+  idbEngine !== null
+    ? new MediaJanitor(mediaStore, idbEngine, defaultRetentionPolicy, controlStore)
+    : null;
+
 /** Requests durable (non-evictable) storage. Best-effort; safe if unsupported. */
 async function requestPersistence(): Promise<void> {
   try {
@@ -228,6 +245,10 @@ async function startup(): Promise<void> {
   // Fire-and-forget: a no-op when nothing is pending.
   exportCoordinator?.resume().catch((err) => logger.warn('Export resume failed (non-fatal)', err));
 
+  // Schedule the media retention janitor (Beta-3 M6). Runs every 30 minutes;
+  // idempotent if the worker is revived and startup() is called again.
+  mediaJanitor?.schedule();
+
   // Cleanup then enrichment — sequential to prevent a race on the in-memory
   // media index (cleanup resets it; enrichment reads from it). Both remain
   // fire-and-forget from startup's perspective: neither blocks controller.init()
@@ -254,6 +275,9 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
   if (alarm.name === ExportCoordinator.ALARM_NAME) {
     exportCoordinator?.handleAlarm();
+  }
+  if (alarm.name === MediaJanitor.ALARM_NAME) {
+    mediaJanitor?.handleAlarm();
   }
 });
 

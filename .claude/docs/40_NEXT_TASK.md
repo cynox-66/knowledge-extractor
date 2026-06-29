@@ -1,46 +1,47 @@
 # Next Task
 
 ## Current Milestone
-Beta-3 (Knowledge Ownership & Export) — **Milestone M6: Media Retention Policy + MediaJanitor**
+Beta-3 (Knowledge Ownership & Export) — **Milestone M7: Incremental export + download-on-demand**
 
 ## Current Objective
-Implement **M6**: Enforce `IMediaRetentionPolicy` to manage storage usage at scale via an alarm-driven `MediaJanitor`.
+Implement **M7**: Enable incremental exports via manifests and dynamic media re-fetching.
 
 ## Why this task exists
-Until now, all extracted media blobs (images, etc.) are kept indefinitely. For long-running extractions (10k+ resources), this will exhaust extension storage quotas. We must enforce a retention policy (e.g., LRU cache limits) to evict media safely.
+Currently, exports dump the entire database and rely on media being present locally. For users with large databases or aggressive media eviction policies, we need to export only the delta (new/changed resources) and be able to re-fetch evicted media on-demand during export.
 
 ## Pre-conditions (must be verified at session start)
-1. Beta-3 Milestone M5 (Obsidian Export Target) is complete.
-2. `IMediaRetentionPolicy` is defined in `packages/types/src/storage/retention.ts`.
+1. Beta-3 Milestone M6 (Media Retention Policy + MediaJanitor) is complete.
 
-## Scope — Milestone M6
+## Scope — Milestone M7
 
-### MediaJanitor (Layer 4)
-- Implement `MediaJanitor` as an MV3-safe background worker process (alarm-driven).
-- **Eviction Logic:** 
-  - Never evict resources that are not yet `ENRICHED` (preserves data for the OCR loop).
-  - Never evict pinned/favorite resources (if the model supports it).
-  - Enforce `maxCacheBytes` limit (from `IMediaRetentionPolicy`) using an LRU eviction strategy based on access time or extraction time.
-  - Do not evict metadata (`IResource`); only evict the raw binary blobs from `IMediaStore`.
+### Incremental Export (Layer 4)
+- Introduce `IExportManifest` to track high-water marks (e.g., `lastExportedAt`) per export target.
+- Update `ExportCoordinator` to query and filter resources based on the manifest, only processing resources that changed since the last export.
 
-### Runtime Integration
-- Integrate `MediaJanitor` into the background worker orchestration (`apps/extension/src/background/index.ts`).
-- Schedule the janitor alarm to run periodically.
+### Download-on-Demand (Layer 4 & Content Script)
+- When exporting a resource whose media blob has been evicted, dispatch a request to a content script (or background fetch) to retrieve the bytes dynamically.
+- Update `ExportCoordinator`/`ExportWriter` to wait for and include these bytes in the final ZIP artifact.
+
+### UI Integration
+- Expose the incremental export option in the Export panel.
+- Optionally expose an `EXPORTED` state flag for UX visibility.
 
 ## Constraints
-- Safe interaction with the `EnrichmentLoop`: ensure no race conditions where media is deleted just before OCR processes it.
-- Yield to the event loop during large janitor sweeps to avoid SW termination.
+- Re-fetching must be robust against network failures and unavailable sources.
+- Incremental state must be stored durably (e.g., in `IControlStateStore`).
+- The `packages/export` layer must remain pure; dynamic fetching happens strictly in Layer 4 orchestration before or during writing.
 
 ## Files Expected to Change
-- `apps/extension/src/background/media-janitor.ts` (New)
-- `apps/extension/src/background/index.ts` (Wiring)
-- Relevant tests
+- `packages/types/src/export/` (New manifest interfaces)
+- `apps/extension/src/background/export/coordinator.ts`
+- Content script fetch paths
+- Associated test suites
 
 ## Risks
-- Storage quota errors during large sweeps if OPFS/IndexedDB metrics are inaccurate.
-- Race conditions with ongoing exports or enrichment.
+- Re-fetching media may trigger rate limits or fail if the original site changed/removed the asset.
+- Complexity in async coordination between the `ExportCoordinator` and content scripts.
 
 ## Exit Criteria
-- `MediaJanitor` correctly evicts older media blobs while respecting the `IMediaRetentionPolicy` bounds.
-- In-progress `ENRICHED` resources are safely bypassed.
-- Full unit test coverage for the janitor logic.
+- `ExportCoordinator` can perform an incremental export yielding only delta changes.
+- Evicted media can be dynamically re-fetched and included in the export artifact.
+- All existing architectural invariants are preserved.
